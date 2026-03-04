@@ -15,7 +15,10 @@ from core.robot import FrankaPandaRobot
 from core.ai_controller import AIController
 from core.task_planner import TaskPlanner
 from core.joint_controller import JointController
+from core.robot_tools import RobotTools
+from perception.vision import ClaudeVision
 from perception.clip_detector import CLIPDetector
+from perception.vision import ClaudeVision
 
 
 def build_configs():
@@ -57,7 +60,28 @@ def build_configs():
 def execute_plan(plan, robot, ai, logger):
     steps     = plan.get("steps", [])
     task_name = plan.get("task_name", plan.get("intent", "task"))
+    intent    = plan.get("intent", "")
     logger.info(f"Executing: '{task_name}' ({len(steps)} steps)")
+
+    # If intent is pick - find the object and call pick_object directly
+    # This bypasses AI-generated move steps which cause RRT issues
+    if intent == "pick":
+        target_obj = plan.get("target_object")
+        if not target_obj:
+            # Try to find object name from steps
+            for step in steps:
+                if step.get("action") == "pick" and step.get("object"):
+                    target_obj = step["object"]
+                    break
+        if target_obj:
+            logger.info(f"Direct pick: '{target_obj}'")
+            success = robot.pick_object(target_obj)
+            if success:
+                ai.update_state(
+                    robot_position=robot.get_end_effector_position(),
+                    holding=target_obj
+                )
+            return
 
     for i, step in enumerate(steps):
         action = step.get("action", "")
@@ -75,9 +99,10 @@ def execute_plan(plan, robot, ai, logger):
                     )
 
             elif action == "place":
-                x = step.get("x", 0.0)
-                y = step.get("y", 0.4)
-                robot.place_object(x, y)
+                x        = step.get("x", 0.0)
+                y        = step.get("y", 0.4)
+                stack_on = step.get("stack_on", None)
+                robot.place_object(x, y, stack_on=stack_on)
                 ai.update_state(
                     robot_position=robot.get_end_effector_position(),
                     holding=None
@@ -120,7 +145,7 @@ def execute_plan(plan, robot, ai, logger):
             robot.step()
 
 
-def handle_special_command(user_input, robot, ai, planner, joints, logger):
+def handle_special_command(user_input, robot, ai, planner, joints, logger, vision=None):
     cmd = user_input.lower().strip()
 
     # ---- Joint control commands ----
@@ -235,6 +260,27 @@ def handle_special_command(user_input, robot, ai, planner, joints, logger):
         print_help()
         return True
 
+    # ---- Camera view commands ----
+    if cmd.startswith("view") or cmd == "camera":
+        parts = cmd.split()
+        preset = parts[1] if len(parts) > 1 else "default"
+        robot.set_camera(preset)
+        return True
+
+    # ---- Claude Vision commands ----
+    if vision and cmd in ["look", "see", "vision", "identify", "suggest"]:
+        if cmd in ["look", "see", "vision"]:
+            print("  Claude Vision analysing scene...")
+            result = vision.analyse_scene(robot.robot)
+            print(f"\n  Claude sees:\n  {result}\n")
+        elif cmd == "identify":
+            result = vision.identify_objects(robot.robot)
+            print(f"\n  Objects identified:\n  {result}\n")
+        elif cmd == "suggest":
+            result = vision.suggest_next_action(robot.robot)
+            print(f"\n  Suggestion:\n  {result}\n")
+        return True
+
     return False
 
 
@@ -270,6 +316,9 @@ def print_help():
     status    robot state       suggest AI suggestion
     ? <q>     ask AI question   forget  clear memory
 
+    look      Claude Vision sees scene
+    identify  Claude identifies all objects
+    suggest   Claude suggests next action
     help   show this menu
     quit   exit
 ========================================
@@ -295,6 +344,9 @@ def main():
     ai      = AIController(ai_config, logger)
     planner = TaskPlanner(planner_config, logger)
     joints  = JointController(robot, logger)
+    tools  = RobotTools(robot, logger)
+    ai.set_tools(tools)
+    vision = ClaudeVision(ai_config, logger)
 
     clip = CLIPDetector(logger)
     clip.load()
@@ -345,7 +397,7 @@ def main():
                 break
 
             if handle_special_command(
-                user_input, robot, ai, planner, joints, logger
+                user_input, robot, ai, planner, joints, logger, vision
             ):
                 continue
 

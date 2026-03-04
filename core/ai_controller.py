@@ -1,339 +1,304 @@
 # =============================================================
-#   AI CONTROLLER - Claude Powered Robot Brain
-#   Handles command interpretation with full conversation memory
-#   Error recovery and retry logic built in
-#   Bridges user commands to task planner
+#   AI CONTROLLER - Claude with Tool Use
+#   Claude now queries the simulation before planning
+#   Grounded reasoning - no more blind guessing
 # =============================================================
 
 import anthropic
 import json
-import time
+
+
+SYSTEM_PROMPT = """You are an AI controller for a Franka Panda 7-axis robot arm in a PyBullet simulation.
+
+You have tools to query the real simulation state. ALWAYS use tools before planning any movement.
+
+RULES:
+1. Before picking anything - call get_object_position AND check_path_clear
+2. Before moving anywhere - call is_point_reachable
+3. If path is blocked - call get_safe_height to find how high to go
+4. Always call get_all_obstacles first to understand the scene
+5. Use plan_pick_sequence for pick operations - it gives you validated steps
+
+RESPONSE FORMAT - always return valid JSON:
+{
+  "response": "human readable explanation of what you're doing",
+  "intent": "pick" | "place" | "move" | "home" | "scan" | "none",
+  "target_object": "object name if picking",
+  "steps": [
+    {"action": "pick", "object": "red"},
+    {"action": "place", "x": 0.2, "y": 0.4},
+    {"action": "place", "x": 0.3, "y": -0.3, "stack_on": "green"},
+    {"action": "move", "x": 0.3, "y": 0.0, "z": 0.5}
+  ],
+  "confidence": 0.95,
+  "reasoning": "brief explanation of why you chose this plan"
+}
+
+For pick operations, return a single step: {"action": "pick", "object": "name"}
+For place operations, return a single step: {"action": "place", "x": 0.2, "y": 0.4}
+The robot code handles all motion details internally."""
 
 
 class AIController:
     def __init__(self, config, logger):
-        self.config = config
-        self.logger = logger
-        self.client = anthropic.Anthropic(api_key=config["api_key"])
-        self.model = config["model"]
-        self.max_tokens = config["max_tokens"]
-
-        # Conversation memory — stores full history
-        self.conversation_history = []
+        self.config  = config
+        self.logger  = logger
+        self.client  = anthropic.Anthropic(api_key=config["api_key"])
+        self.model   = config["model"]
+        self.max_tokens   = config["max_tokens"]
         self.memory_length = config["memory_length"]
 
-        # Current understood world state
-        self.known_objects = {}
-        self.robot_position = [0.0, 0.0, 0.5]
-        self.holding = None
+        self.conversation_history = []
+        self.robot_state = {
+            "position":        (0, 0, 0),
+            "holding":         None,
+            "detected_objects": {},
+        }
 
-        # Retry settings
-        self.max_retries = 3
-        self.retry_delay = 1.0
+        # Robot tools instance - set after robot is created
+        self.tools_instance = None
 
-        self.system_prompt = """You are an intelligent AI controller for a Franka Panda robot arm.
+        self.logger.info("AI Controller initialized with tool use")
 
-You receive:
-1. A user command in natural language
-2. Current robot state
-3. Objects detected in the scene with coordinates
-4. Memory of recent actions
-
-You must respond ONLY with valid JSON in this exact format:
-{
-    "intent": "pick|place|move|home|scan|stack|sort|custom",
-    "target_object": "red|blue|green|null",
-    "target_position": {"x": 0.0, "y": 0.0, "z": 0.5},
-    "steps": [
-        {"action": "pick", "object": "red", "description": "picking red block"},
-        {"action": "place", "x": 0.0, "y": 0.4, "description": "placing at target"}
-    ],
-    "response": "Natural language confirmation of what you will do",
-    "confidence": 0.95
-}
-
-Action types in steps:
-- pick: pick up named object
-- place: place at x,y coordinates  
-- move: move end effector to x,y,z
-- home: return to home position
-- open_gripper: open gripper
-- close_gripper: close gripper
-- scan: scan scene with camera
-
-Workspace limits: x(-0.8,0.8), y(-0.8,0.8), z(0.05,1.2)
-
-Rules:
-- Always add z offset of 0.3 above objects before picking
-- Never command z below 0.05
-- If holding object, place before picking another
-- For stacking: place each block 0.09m higher than last
-- Sort zones: red=(-0.4,0.4), blue=(0.0,0.4), green=(0.4,0.4)
-- Confidence below 0.5 means you are unsure — say so in response
-- ONLY return JSON, absolutely no other text"""
-
-    # ----------------------------------------------------------
-    # State management
-    # ----------------------------------------------------------
+    def set_tools(self, robot_tools_instance):
+        """Connect robot tools to this controller"""
+        self.tools_instance = robot_tools_instance
+        self.logger.info("Robot tools connected to AI")
 
     def update_state(self, robot_position=None, holding=None,
                      detected_objects=None):
-        """Update AI's understanding of current world state"""
         if robot_position:
-            self.robot_position = list(robot_position)
+            self.robot_state["position"] = robot_position
         if holding is not None:
-            self.holding = holding
+            self.robot_state["holding"] = holding
         if detected_objects:
-            self.known_objects = {
-                name: list(pos)
-                for name, pos in detected_objects.items()
-            }
+            self.robot_state["detected_objects"] = detected_objects
 
-    # ----------------------------------------------------------
-    # Memory management
-    # ----------------------------------------------------------
+    def _build_context(self, user_command, detected_objects):
+        """Build context message for Claude"""
+        pos = self.robot_state["position"]
+        holding = self.robot_state["holding"] or "nothing"
 
-    def add_to_history(self, role, content):
-        """Add message to conversation history"""
+        obj_str = ""
+        if detected_objects:
+            parts = []
+            for name, pos_obj in detected_objects.items():
+                if pos_obj:
+                    parts.append(
+                        f"{name} at ({pos_obj[0]:.3f}, {pos_obj[1]:.3f}, {pos_obj[2]:.3f})"
+                    )
+            obj_str = ", ".join(parts)
+
+        context = (
+            f"Robot position: ({pos[0]:.3f}, {pos[1]:.3f}, {pos[2]:.3f})\n"
+            f"Holding: {holding}\n"
+            f"Visible objects: {obj_str or 'none'}\n"
+            f"Command: {user_command}\n\n"
+            f"Use your tools to query the simulation, then return a JSON plan."
+        )
+        return context
+
+    def process_command(self, user_command, detected_objects=None):
+        """
+        Process a command using Claude with tool use.
+        Claude will call simulation tools before planning.
+        """
+        if not self.tools_instance:
+            self.logger.warning("No tools connected - falling back to basic mode")
+            return self._fallback_plan(user_command)
+
+        context = self._build_context(user_command, detected_objects)
+
+        # Add to conversation history
         self.conversation_history.append({
-            "role": role,
-            "content": content
+            "role": "user",
+            "content": context
         })
-        # Keep history within memory limit
+
+        # Trim history
         if len(self.conversation_history) > self.memory_length * 2:
-            # Keep system context + recent messages
-            self.conversation_history = (
-                self.conversation_history[-self.memory_length * 2:]
+            self.conversation_history = self.conversation_history[
+                -self.memory_length * 2:
+            ]
+
+        tools = self.tools_instance.get_tool_definitions()
+
+        self.logger.info(f"USER COMMAND: '{user_command}'")
+        print(f"\n  Claude thinking with tools...")
+
+        # Agentic loop - Claude keeps calling tools until done
+        messages = list(self.conversation_history)
+        max_tool_rounds = 8
+
+        for round_num in range(max_tool_rounds):
+            response = self.client.messages.create(
+                model=self.model,
+                max_tokens=self.max_tokens,
+                system=SYSTEM_PROMPT,
+                tools=tools,
+                messages=messages
             )
 
-    def get_context_summary(self):
-        """Build context string from recent history"""
-        if not self.conversation_history:
-            return "No previous actions."
-
-        recent = self.conversation_history[-6:]  # Last 3 exchanges
-        summary = "Recent conversation:\n"
-        for msg in recent:
-            if msg["role"] == "user":
-                summary += f"  User: {msg['content'][:100]}\n"
-            else:
-                try:
-                    parsed = json.loads(msg["content"])
-                    summary += f"  Robot: {parsed.get('response', '')[:100]}\n"
-                except Exception:
-                    summary += f"  Robot: {msg['content'][:100]}\n"
-        return summary
-
-    def clear_memory(self):
-        """Clear conversation history"""
-        self.conversation_history = []
-        self.logger.info("AI memory cleared")
-
-    # ----------------------------------------------------------
-    # Core command processing
-    # ----------------------------------------------------------
-
-    def process_command(self, user_input, detected_objects=None):
-        """
-        Main function. Takes user text, returns structured command.
-        Has retry logic for API failures.
-        """
-        if detected_objects:
-            self.update_state(detected_objects=detected_objects)
-
-        # Build full context prompt
-        prompt = self._build_prompt(user_input)
-
-        # Add to history
-        self.add_to_history("user", user_input)
-
-        # Try with retries
-        for attempt in range(self.max_retries):
-            try:
-                response = self._call_api(prompt)
-                command = self._parse_response(response)
-
-                # Add response to history
-                self.add_to_history("assistant", response)
-
-                # Log
-                self.logger.log_command(user_input, command)
-                self.logger.info(
-                    f"AI: {command.get('response', 'executing command')}"
-                )
-
-                return command
-
-            except json.JSONDecodeError as e:
-                self.logger.warning(
-                    f"JSON parse failed (attempt {attempt+1}): {e}"
-                )
-                if attempt < self.max_retries - 1:
-                    time.sleep(self.retry_delay)
-
-            except anthropic.APIError as e:
-                self.logger.error(f"API error (attempt {attempt+1}): {e}")
-                if attempt < self.max_retries - 1:
-                    time.sleep(self.retry_delay * (attempt + 1))
-
-            except Exception as e:
-                self.logger.error(f"Unexpected error: {e}")
+            # Check stop reason
+            if response.stop_reason == "end_turn":
+                # Claude finished - extract final JSON
                 break
 
-        # All retries failed — return safe fallback
-        self.logger.warning("All retries failed, using fallback command")
-        return self._fallback_command(user_input)
+            elif response.stop_reason == "tool_use":
+                # Claude wants to call tools
+                tool_results = []
+                assistant_content = []
 
-    def _call_api(self, prompt):
-        """Make API call to Claude"""
-        messages = [{"role": "user", "content": prompt}]
+                for block in response.content:
+                    assistant_content.append(block)
+
+                    if block.type == "tool_use":
+                        result = self.tools_instance.execute_tool(
+                            block.name, block.input
+                        )
+                        tool_results.append({
+                            "type":        "tool_result",
+                            "tool_use_id": block.id,
+                            "content":     result
+                        })
+
+                # Add assistant message with tool calls
+                messages.append({
+                    "role":    "assistant",
+                    "content": assistant_content
+                })
+
+                # Add tool results
+                messages.append({
+                    "role":    "user",
+                    "content": tool_results
+                })
+
+            else:
+                break
+
+        # Extract final text response
+        final_text = ""
+        for block in response.content:
+            if hasattr(block, "text"):
+                final_text = block.text
+                break
+
+        # Parse JSON from response
+        plan = self._parse_response(final_text, user_command)
+
+        # Add assistant response to history
+        self.conversation_history.append({
+            "role":    "assistant",
+            "content": final_text
+        })
+
+        self.logger.info(f"AI: {plan.get('response', '')}")
+        return plan
+
+    def _parse_response(self, text, original_command):
+        """Parse JSON from Claude response"""
+        import re
+
+        # Try to extract JSON block
+        json_match = re.search(r'\{.*\}', text, re.DOTALL)
+        if json_match:
+            try:
+                plan = json.loads(json_match.group())
+                return plan
+            except json.JSONDecodeError:
+                pass
+
+        # Fallback - build basic plan from text
+        self.logger.warning("Could not parse JSON from AI response")
+        return self._fallback_plan(original_command, text)
+
+    def _fallback_plan(self, command, ai_text=""):
+        """Basic fallback when tool use fails"""
+        cmd = command.lower()
+        response = ai_text or f"Processing: {command}"
+
+        if "pick" in cmd or "grab" in cmd or "get" in cmd:
+            for color in ["red", "blue", "green"]:
+                if color in cmd:
+                    return {
+                        "response": response,
+                        "intent": "pick",
+                        "target_object": color,
+                        "steps": [{"action": "pick", "object": color}],
+                        "confidence": 0.7
+                    }
+
+        if "home" in cmd or "reset" in cmd:
+            return {
+                "response": "Going home",
+                "intent": "home",
+                "steps": [{"action": "home"}],
+                "confidence": 1.0
+            }
+
+        return {
+            "response": response or "Command not understood",
+            "intent": "none",
+            "steps": [],
+            "confidence": 0.3
+        }
+
+    def ask(self, question):
+        """Ask Claude a question about the scene"""
+        if not self.tools_instance:
+            return "Tools not connected"
 
         response = self.client.messages.create(
             model=self.model,
-            max_tokens=self.max_tokens,
-            system=self.system_prompt,
-            messages=messages
+            max_tokens=500,
+            system="You are a robot assistant. Answer questions about the robot simulation concisely.",
+            tools=self.tools_instance.get_tool_definitions(),
+            messages=[{"role": "user", "content": question}]
         )
 
-        return response.content[0].text.strip()
+        # Handle tool calls in question answering too
+        messages = [{"role": "user", "content": question}]
 
-    def _build_prompt(self, user_input):
-        """Build full prompt with world state and memory"""
-        # Object positions
-        if self.known_objects:
-            obj_str = "Detected objects:\n"
-            for name, pos in self.known_objects.items():
-                obj_str += (
-                    f"  {name}: x={pos[0]:.3f}, "
-                    f"y={pos[1]:.3f}, z={pos[2]:.3f}\n"
-                )
-        else:
-            obj_str = "No objects detected yet.\n"
-
-        prompt = f"""ROBOT STATE:
-Position: x={self.robot_position[0]:.3f}, y={self.robot_position[1]:.3f}, z={self.robot_position[2]:.3f}
-Holding: {self.holding or 'nothing'}
-Gripper: {'closed' if self.holding else 'open'}
-
-{obj_str}
-MEMORY:
-{self.get_context_summary()}
-
-USER COMMAND: "{user_input}"
-
-Respond with JSON only."""
-
-        return prompt
-
-    def _parse_response(self, response_text):
-        """Parse and validate JSON response from Claude"""
-        # Clean response
-        text = response_text.strip()
-
-        # Remove markdown code blocks if present
-        if text.startswith("```"):
-            lines = text.split("\n")
-            text = "\n".join(lines[1:-1])
-
-        command = json.loads(text)
-
-        # Validate required fields
-        required = ["intent", "steps", "response"]
-        for field in required:
-            if field not in command:
-                raise ValueError(f"Missing required field: {field}")
-
-        # Validate steps
-        for step in command["steps"]:
-            if "action" not in step:
-                raise ValueError("Step missing action field")
-
-        return command
-
-    def _fallback_command(self, user_input):
-        """Safe fallback when AI fails"""
-        return {
-            "intent": "move",
-            "target_object": None,
-            "target_position": {"x": 0.0, "y": 0.0, "z": 0.5},
-            "steps": [
-                {
-                    "action": "move",
-                    "x": 0.0,
-                    "y": 0.0,
-                    "z": 0.5,
-                    "description": "moving to safe position"
-                }
-            ],
-            "response": "I had trouble understanding that. Moving to safe position.",
-            "confidence": 0.0
-        }
-
-    # ----------------------------------------------------------
-    # Direct command shortcuts
-    # ----------------------------------------------------------
-
-    def ask(self, question):
-        """
-        Ask Claude a general question about the scene or task.
-        Returns natural language answer — not a robot command.
-        """
-        try:
-            obj_str = ""
-            if self.known_objects:
-                obj_str = "Current objects: " + ", ".join(
-                    f"{n} at ({p[0]:.2f},{p[1]:.2f})"
-                    for n, p in self.known_objects.items()
-                )
-
+        for _ in range(4):
             response = self.client.messages.create(
                 model=self.model,
-                max_tokens=300,
-                system="You are a helpful robot assistant. Answer questions about the robot workspace concisely.",
-                messages=[{
-                    "role": "user",
-                    "content": f"{obj_str}\n\nQuestion: {question}"
-                }]
+                max_tokens=500,
+                system="Answer questions about the robot simulation concisely.",
+                tools=self.tools_instance.get_tool_definitions(),
+                messages=messages
             )
-            answer = response.content[0].text.strip()
-            self.logger.info(f"Q: {question} → A: {answer}")
-            return answer
 
-        except Exception as e:
-            self.logger.error(f"Ask failed: {e}")
-            return "I couldn't answer that question right now."
+            if response.stop_reason == "end_turn":
+                break
+            elif response.stop_reason == "tool_use":
+                tool_results = []
+                assistant_content = list(response.content)
+                for block in response.content:
+                    if block.type == "tool_use":
+                        result = self.tools_instance.execute_tool(
+                            block.name, block.input
+                        )
+                        tool_results.append({
+                            "type":        "tool_result",
+                            "tool_use_id": block.id,
+                            "content":     result
+                        })
+                messages.append({"role": "assistant", "content": assistant_content})
+                messages.append({"role": "user", "content": tool_results})
+
+        for block in response.content:
+            if hasattr(block, "text"):
+                return block.text
+
+        return "No response"
 
     def suggest_next_action(self):
-        """
-        Ask Claude to suggest what the robot should do next
-        based on current scene state.
-        """
-        if not self.known_objects:
-            return "Scan the scene first to see what objects are available."
-
-        obj_summary = ", ".join(
-            f"{n} at ({p[0]:.2f},{p[1]:.2f},{p[2]:.2f})"
-            for n, p in self.known_objects.items()
+        return self.ask(
+            "Based on the current scene, what should the robot do next? "
+            "Check object and obstacle positions first."
         )
 
-        try:
-            response = self.client.messages.create(
-                model=self.model,
-                max_tokens=150,
-                system="You are a robot task advisor. Suggest one useful next action concisely.",
-                messages=[{
-                    "role": "user",
-                    "content": (
-                        f"Robot is holding: {self.holding or 'nothing'}. "
-                        f"Objects: {obj_summary}. "
-                        f"What should the robot do next?"
-                    )
-                }]
-            )
-            suggestion = response.content[0].text.strip()
-            self.logger.info(f"Suggestion: {suggestion}")
-            return suggestion
-
-        except Exception as e:
-            self.logger.error(f"Suggest failed: {e}")
-            return "Unable to generate suggestion."
+    def clear_memory(self):
+        self.conversation_history = []
+        self.logger.info("Conversation memory cleared")
