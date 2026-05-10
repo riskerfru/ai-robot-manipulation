@@ -1,0 +1,778 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>AI Robot Control — Franka Panda</title>
+<style>
+  :root {
+    --bg:      #0d1117;
+    --panel:   #161b22;
+    --border:  #30363d;
+    --accent:  #58a6ff;
+    --green:   #3fb950;
+    --orange:  #d29922;
+    --red:     #f85149;
+    --text:    #e6edf3;
+    --dim:     #8b949e;
+    --card:    #21262d;
+  }
+
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+
+  body {
+    background: var(--bg);
+    color: var(--text);
+    font-family: 'Segoe UI', system-ui, sans-serif;
+    font-size: 14px;
+    height: 100vh;
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
+  }
+
+  /* ── HEADER ── */
+  header {
+    background: var(--panel);
+    border-bottom: 1px solid var(--border);
+    padding: 12px 20px;
+    display: flex;
+    align-items: center;
+    gap: 16px;
+    flex-shrink: 0;
+  }
+
+  header h1 {
+    font-size: 15px;
+    font-weight: 600;
+    color: var(--accent);
+  }
+
+  .status-dot {
+    width: 8px; height: 8px;
+    border-radius: 50%;
+    background: var(--green);
+    animation: pulse 2s infinite;
+  }
+
+  .status-dot.stopped { background: var(--red); animation: none; }
+
+  @keyframes pulse {
+    0%, 100% { opacity: 1; }
+    50%       { opacity: 0.4; }
+  }
+
+  #estop-btn {
+    margin-left: auto;
+    background: var(--red);
+    color: white;
+    border: none;
+    padding: 6px 16px;
+    border-radius: 6px;
+    font-weight: 700;
+    font-size: 13px;
+    cursor: pointer;
+    letter-spacing: 1px;
+  }
+
+  #estop-btn:hover { opacity: 0.85; }
+
+  #resume-btn {
+    background: var(--green);
+    color: white;
+    border: none;
+    padding: 6px 16px;
+    border-radius: 6px;
+    font-weight: 600;
+    font-size: 13px;
+    cursor: pointer;
+    display: none;
+  }
+
+  /* ── MAIN LAYOUT ── */
+  main {
+    display: grid;
+    grid-template-columns: 340px 1fr 300px;
+    grid-template-rows: 1fr;
+    gap: 0;
+    flex: 1;
+    overflow: hidden;
+  }
+
+  /* ── PANELS ── */
+  .panel {
+    border-right: 1px solid var(--border);
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
+  }
+
+  .panel:last-child { border-right: none; }
+
+  .panel-header {
+    padding: 10px 16px;
+    background: var(--panel);
+    border-bottom: 1px solid var(--border);
+    font-size: 11px;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 1px;
+    color: var(--dim);
+    flex-shrink: 0;
+  }
+
+  .panel-body {
+    flex: 1;
+    overflow-y: auto;
+    padding: 16px;
+  }
+
+  /* ── SCENE MAP (2D top-down) ── */
+  #scene-canvas {
+    width: 100%;
+    background: var(--card);
+    border-radius: 8px;
+    border: 1px solid var(--border);
+    display: block;
+  }
+
+  /* ── COMMAND BOARD ── */
+  .command-section { margin-bottom: 20px; }
+
+  .command-section label {
+    display: block;
+    font-size: 11px;
+    color: var(--dim);
+    margin-bottom: 6px;
+    text-transform: uppercase;
+    letter-spacing: 1px;
+  }
+
+  textarea {
+    width: 100%;
+    background: var(--card);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    color: var(--text);
+    padding: 10px;
+    font-family: 'Consolas', monospace;
+    font-size: 13px;
+    resize: vertical;
+    min-height: 80px;
+  }
+
+  textarea:focus {
+    outline: none;
+    border-color: var(--accent);
+  }
+
+  .btn-row { display: flex; gap: 8px; margin-top: 8px; }
+
+  .btn {
+    flex: 1;
+    padding: 8px;
+    border-radius: 6px;
+    border: none;
+    font-size: 13px;
+    font-weight: 600;
+    cursor: pointer;
+  }
+
+  .btn-primary { background: var(--accent); color: #0d1117; }
+  .btn-primary:hover { opacity: 0.85; }
+  .btn-primary:disabled { opacity: 0.4; cursor: not-allowed; }
+
+  .btn-secondary {
+    background: var(--card);
+    color: var(--text);
+    border: 1px solid var(--border);
+  }
+
+  .btn-secondary:hover { border-color: var(--accent); }
+
+  /* Quick commands */
+  .quick-cmds { display: flex; flex-direction: column; gap: 6px; }
+
+  .quick-cmd {
+    background: var(--card);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 8px 12px;
+    cursor: pointer;
+    font-size: 12px;
+    color: var(--dim);
+    text-align: left;
+  }
+
+  .quick-cmd:hover {
+    border-color: var(--accent);
+    color: var(--text);
+  }
+
+  /* Robot status */
+  .status-grid {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 8px;
+    margin-bottom: 16px;
+  }
+
+  .stat-card {
+    background: var(--card);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 10px;
+  }
+
+  .stat-label {
+    font-size: 10px;
+    color: var(--dim);
+    text-transform: uppercase;
+    letter-spacing: 1px;
+    margin-bottom: 4px;
+  }
+
+  .stat-value {
+    font-size: 13px;
+    font-weight: 600;
+    font-family: 'Consolas', monospace;
+  }
+
+  /* Objects list */
+  .object-item {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    padding: 8px 10px;
+    background: var(--card);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    margin-bottom: 6px;
+  }
+
+  .obj-dot {
+    width: 12px; height: 12px;
+    border-radius: 50%;
+    flex-shrink: 0;
+  }
+
+  .obj-info { flex: 1; }
+  .obj-name { font-weight: 600; font-size: 13px; }
+  .obj-pos  { font-size: 11px; color: var(--dim); font-family: monospace; }
+
+  .reach-badge {
+    font-size: 10px;
+    font-weight: 700;
+    padding: 2px 6px;
+    border-radius: 4px;
+    letter-spacing: 0.5px;
+  }
+
+  .badge-ok     { background: rgba(63,185,80,0.15); color: var(--green); }
+  .badge-warn   { background: rgba(210,153,34,0.15); color: var(--orange); }
+  .badge-danger { background: rgba(248,81,73,0.15);  color: var(--red); }
+
+  /* Agent log */
+  #agent-log {
+    background: var(--card);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 10px;
+    font-family: 'Consolas', monospace;
+    font-size: 12px;
+    height: 100%;
+    overflow-y: auto;
+    line-height: 1.8;
+  }
+
+  .log-step    { color: var(--accent); }
+  .log-think   { color: var(--dim); font-style: italic; }
+  .log-action  { color: var(--text); }
+  .log-success { color: var(--green); }
+  .log-fail    { color: var(--red); }
+  .log-info    { color: var(--orange); }
+
+  /* Progress bar */
+  #progress-bar {
+    height: 3px;
+    background: var(--accent);
+    width: 0%;
+    transition: width 0.3s ease;
+    border-radius: 2px;
+    margin-bottom: 8px;
+  }
+
+  /* Scrollbar */
+  ::-webkit-scrollbar { width: 4px; }
+  ::-webkit-scrollbar-track { background: transparent; }
+  ::-webkit-scrollbar-thumb { background: var(--border); border-radius: 2px; }
+</style>
+</head>
+<body>
+
+<!-- HEADER -->
+<header>
+  <div class="status-dot" id="status-dot"></div>
+  <h1>🤖 AI Robot Control — Franka Panda</h1>
+  <span id="holding-label" style="color:var(--dim);font-size:12px;"></span>
+  <button id="estop-btn" onclick="emergencyStop()">🛑 E-STOP</button>
+  <button id="resume-btn" onclick="resume()">▶ RESUME</button>
+</header>
+
+<!-- MAIN -->
+<main>
+
+  <!-- LEFT: Scene map + objects -->
+  <div class="panel">
+    <div class="panel-header">Scene View</div>
+    <div class="panel-body">
+      <canvas id="scene-canvas" height="300"></canvas>
+
+      <div style="margin-top:16px;">
+        <div class="panel-header" style="padding:0 0 8px; background:none; border:none;">
+          Objects
+        </div>
+        <div id="objects-list"></div>
+      </div>
+
+      <div style="margin-top:12px;">
+        <div class="panel-header" style="padding:0 0 8px; background:none; border:none;">
+          Robot
+        </div>
+        <div class="status-grid" id="robot-stats"></div>
+      </div>
+    </div>
+  </div>
+
+  <!-- CENTRE: Command board -->
+  <div class="panel">
+    <div class="panel-header">Command Board</div>
+    <div class="panel-body">
+
+      <div class="command-section">
+        <label>Warehouse Order</label>
+        <textarea id="order-input"
+          placeholder="e.g. move red to 0.5 0.0, then stack blue on green"></textarea>
+        <div class="btn-row">
+          <button class="btn btn-primary" id="run-btn" onclick="runOrder()">
+            ▶ Run Agent
+          </button>
+          <button class="btn btn-secondary" onclick="clearLog()">
+            Clear Log
+          </button>
+        </div>
+      </div>
+
+      <div class="command-section">
+        <label>Quick Commands</label>
+        <div class="quick-cmds">
+          <button class="quick-cmd"
+            onclick="setOrder('move red to 0.5 0.0, then stack blue on green')">
+            📦 Move red → stack blue on green
+          </button>
+          <button class="quick-cmd"
+            onclick="setOrder('stack blue on green')">
+            🗼 Stack blue on green
+          </button>
+          <button class="quick-cmd"
+            onclick="setOrder('move red to 0.5 0.0, move blue to 0.5 0.2, move green to 0.5 -0.2')">
+            📋 Sort all blocks to right side
+          </button>
+          <button class="quick-cmd"
+            onclick="setOrder('fulfil this order: move red to 0.5 0.0, stack blue on green, then bring green to 0.4 0.2')">
+            🏭 Full warehouse order
+          </button>
+        </div>
+      </div>
+
+      <div class="command-section">
+        <label>Reachability Check</label>
+        <div style="display:flex;gap:8px;align-items:center;">
+          <input id="reach-x" type="number" step="0.05" value="0.4"
+            style="width:70px;background:var(--card);border:1px solid var(--border);
+                   border-radius:6px;padding:6px 8px;color:var(--text);">
+          <input id="reach-y" type="number" step="0.05" value="0.0"
+            style="width:70px;background:var(--card);border:1px solid var(--border);
+                   border-radius:6px;padding:6px 8px;color:var(--text);">
+          <button class="btn btn-secondary" style="flex:0;padding:6px 12px;"
+            onclick="checkReach()">Check</button>
+          <span id="reach-result" style="font-size:12px;"></span>
+        </div>
+      </div>
+
+    </div>
+  </div>
+
+  <!-- RIGHT: Agent log -->
+  <div class="panel">
+    <div class="panel-header">Agent Log</div>
+    <div class="panel-body" style="padding:10px;">
+      <div id="progress-bar"></div>
+      <div id="agent-log">
+        <span class="log-info">System ready. Enter an order and press Run Agent.</span>
+      </div>
+    </div>
+  </div>
+
+</main>
+
+<script>
+// =============================================================
+//   FRONTEND LOGIC
+// =============================================================
+
+const POLL_MS    = 800;    // scene poll interval
+const OBJ_COLORS = { red: '#f85149', blue: '#58a6ff', green: '#3fb950' };
+
+let sceneData    = null;
+let logEntries   = [];
+let lastLogCount = 0;
+
+// ── Canvas scene renderer ──
+const canvas = document.getElementById('scene-canvas');
+const ctx    = canvas.getContext('2d');
+
+function resizeCanvas() {
+  canvas.width  = canvas.offsetWidth;
+  canvas.height = 300;
+}
+resizeCanvas();
+window.addEventListener('resize', resizeCanvas);
+
+// World → canvas coordinate mapping
+// Table: x [0.0, 0.7], y [-0.4, 0.4]
+// Robot base at origin (0, 0)
+function worldToCanvas(wx, wy) {
+  const PAD = 20;
+  const W   = canvas.width  - PAD * 2;
+  const H   = canvas.height - PAD * 2;
+
+  // x: 0.0 → left, 0.75 → right
+  const cx = PAD + (wx / 0.75) * W;
+  // y: -0.45 → bottom, 0.45 → top (inverted for canvas)
+  const cy = PAD + (1 - (wy + 0.45) / 0.9) * H;
+  return [cx, cy];
+}
+
+function mToCanvas(m) {
+  const W = canvas.width - 40;
+  return (m / 0.75) * W;
+}
+
+function drawScene(data) {
+  ctx.clearRect(0, 0, canvas.width, canvas.height);
+
+  // Background
+  ctx.fillStyle = '#161b22';
+  ctx.fillRect(0, 0, canvas.width, canvas.height);
+
+  // Grid
+  ctx.strokeStyle = 'rgba(255,255,255,0.04)';
+  ctx.lineWidth = 1;
+  for (let x = 0; x <= 0.75; x += 0.1) {
+    const [cx] = worldToCanvas(x, 0);
+    ctx.beginPath();
+    ctx.moveTo(cx, 0);
+    ctx.lineTo(cx, canvas.height);
+    ctx.stroke();
+  }
+  for (let y = -0.45; y <= 0.45; y += 0.1) {
+    const [, cy] = worldToCanvas(0, y);
+    ctx.beginPath();
+    ctx.moveTo(0, cy);
+    ctx.lineTo(canvas.width, cy);
+    ctx.stroke();
+  }
+
+  // Table outline
+  const [tx1, ty1] = worldToCanvas(0.0, -0.40);
+  const [tx2, ty2] = worldToCanvas(0.7,  0.40);
+  ctx.strokeStyle = 'rgba(100,70,30,0.6)';
+  ctx.lineWidth = 1.5;
+  ctx.strokeRect(tx1, ty2, tx2 - tx1, ty1 - ty2);
+  ctx.fillStyle = 'rgba(60,40,15,0.15)';
+  ctx.fillRect(tx1, ty2, tx2 - tx1, ty1 - ty2);
+
+  // Reachability zones
+  const [rx, ry] = worldToCanvas(0, 0);
+
+  // Dead zone (grey)
+  ctx.beginPath();
+  ctx.arc(rx, ry, mToCanvas(0.25), 0, Math.PI * 2);
+  ctx.strokeStyle = 'rgba(120,120,120,0.3)';
+  ctx.lineWidth = 1;
+  ctx.stroke();
+
+  // Safe zone fill (green tint)
+  ctx.beginPath();
+  ctx.arc(rx, ry, mToCanvas(0.65), 0, Math.PI * 2);
+  ctx.fillStyle = 'rgba(63,185,80,0.06)';
+  ctx.fill();
+  ctx.strokeStyle = 'rgba(63,185,80,0.5)';
+  ctx.lineWidth = 1.5;
+  ctx.stroke();
+
+  // Warning zone (orange ring)
+  ctx.beginPath();
+  ctx.arc(rx, ry, mToCanvas(0.75), 0, Math.PI * 2);
+  ctx.strokeStyle = 'rgba(210,153,34,0.5)';
+  ctx.lineWidth = 1.5;
+  ctx.stroke();
+
+  // Robot base
+  ctx.beginPath();
+  ctx.arc(rx, ry, 6, 0, Math.PI * 2);
+  ctx.fillStyle = '#58a6ff';
+  ctx.fill();
+
+  if (!data) return;
+
+  // Robot end effector
+  if (data.robot && data.robot.position) {
+    const [ex, ey] = worldToCanvas(data.robot.position[0], data.robot.position[1]);
+    ctx.beginPath();
+    ctx.arc(ex, ey, 5, 0, Math.PI * 2);
+    ctx.fillStyle = data.robot.holding ? '#d29922' : '#8b949e';
+    ctx.fill();
+
+    // Line from base to EE
+    ctx.beginPath();
+    ctx.moveTo(rx, ry);
+    ctx.lineTo(ex, ey);
+    ctx.strokeStyle = 'rgba(88,166,255,0.3)';
+    ctx.lineWidth = 1;
+    ctx.stroke();
+  }
+
+  // Objects
+  if (data.objects) {
+    for (const [name, info] of Object.entries(data.objects)) {
+      if (!info.position) continue;
+      const [ox, oy] = worldToCanvas(info.position[0], info.position[1]);
+      const color    = OBJ_COLORS[name] || '#fff';
+
+      // Object circle
+      ctx.beginPath();
+      ctx.arc(ox, oy, 9, 0, Math.PI * 2);
+      ctx.fillStyle = color + '33';
+      ctx.fill();
+      ctx.strokeStyle = color;
+      ctx.lineWidth = 2;
+      ctx.stroke();
+
+      // Label
+      ctx.fillStyle = color;
+      ctx.font = 'bold 10px Consolas';
+      ctx.textAlign = 'center';
+      ctx.fillText(name[0].toUpperCase(), ox, oy + 4);
+
+      // Reachability indicator
+      if (info.reachability) {
+        const sev = info.reachability.severity;
+        const indColor = sev === 'ok' ? '#3fb950' :
+                         sev === 'warning' ? '#d29922' : '#f85149';
+        ctx.beginPath();
+        ctx.arc(ox + 8, oy - 8, 4, 0, Math.PI * 2);
+        ctx.fillStyle = indColor;
+        ctx.fill();
+      }
+    }
+  }
+
+  // Legend
+  const legends = [
+    ['#3fb950', 'Safe (0.25-0.65m)'],
+    ['#d29922', 'Edge (0.65-0.75m)'],
+    ['#8b949e', 'Too close (<0.25m)'],
+  ];
+  ctx.font = '9px system-ui';
+  legends.forEach(([c, t], i) => {
+    ctx.fillStyle = c;
+    ctx.fillRect(8, canvas.height - 14 - i * 14, 8, 8);
+    ctx.fillStyle = '#8b949e';
+    ctx.textAlign = 'left';
+    ctx.fillText(t, 20, canvas.height - 7 - i * 14);
+  });
+}
+
+// ── Update objects list ──
+function updateObjectsList(data) {
+  const el = document.getElementById('objects-list');
+  if (!data || !data.objects) { el.innerHTML = ''; return; }
+
+  el.innerHTML = Object.entries(data.objects).map(([name, info]) => {
+    const color = OBJ_COLORS[name] || '#fff';
+    const reach = info.reachability;
+    const badgeClass = !reach ? '' :
+                       reach.severity === 'ok'      ? 'badge-ok' :
+                       reach.severity === 'warning'  ? 'badge-warn' : 'badge-danger';
+    const badgeText = !reach ? '' :
+                      reach.severity === 'ok'      ? 'OK' :
+                      reach.severity === 'warning'  ? 'EDGE' : 'OUT OF REACH';
+    const pos = info.position;
+    return `
+      <div class="object-item">
+        <div class="obj-dot" style="background:${color}"></div>
+        <div class="obj-info">
+          <div class="obj-name">${name}</div>
+          <div class="obj-pos">${pos ? `(${pos[0].toFixed(2)}, ${pos[1].toFixed(2)}, ${pos[2].toFixed(2)})` : 'unknown'}</div>
+        </div>
+        ${reach ? `<span class="reach-badge ${badgeClass}">${badgeText}</span>` : ''}
+      </div>`;
+  }).join('');
+}
+
+// ── Update robot stats ──
+function updateRobotStats(data) {
+  const el = document.getElementById('robot-stats');
+  if (!data || !data.robot) { el.innerHTML = ''; return; }
+  const pos = data.robot.position;
+  el.innerHTML = `
+    <div class="stat-card">
+      <div class="stat-label">Position X</div>
+      <div class="stat-value">${pos ? pos[0].toFixed(3) : '-'}m</div>
+    </div>
+    <div class="stat-card">
+      <div class="stat-label">Position Y</div>
+      <div class="stat-value">${pos ? pos[1].toFixed(3) : '-'}m</div>
+    </div>
+    <div class="stat-card">
+      <div class="stat-label">Height Z</div>
+      <div class="stat-value">${pos ? pos[2].toFixed(3) : '-'}m</div>
+    </div>
+    <div class="stat-card">
+      <div class="stat-label">Holding</div>
+      <div class="stat-value" style="color:${data.robot.holding ? '#d29922' : '#8b949e'}">
+        ${data.robot.holding || 'nothing'}
+      </div>
+    </div>`;
+
+  document.getElementById('holding-label').textContent =
+    data.robot.holding ? `Holding: ${data.robot.holding}` : '';
+}
+
+// ── Update e-stop UI ──
+function updateEstop(active) {
+  const dot     = document.getElementById('status-dot');
+  const estopBtn  = document.getElementById('estop-btn');
+  const resumeBtn = document.getElementById('resume-btn');
+  if (active) {
+    dot.classList.add('stopped');
+    estopBtn.style.display  = 'none';
+    resumeBtn.style.display = 'block';
+  } else {
+    dot.classList.remove('stopped');
+    estopBtn.style.display  = 'block';
+    resumeBtn.style.display = 'none';
+  }
+}
+
+// ── Poll scene state ──
+async function pollScene() {
+  try {
+    const res  = await fetch('/scene');
+    const data = await res.json();
+    sceneData  = data;
+    drawScene(data);
+    updateObjectsList(data);
+    updateRobotStats(data);
+    updateEstop(data.estop);
+    updateRunBtn(data.agent_running);
+    updateLog(data.log || []);
+  } catch (e) {
+    // Server not yet ready — silent
+  }
+}
+
+// ── Log updates ──
+function updateLog(entries) {
+  if (entries.length === lastLogCount) return;
+  lastLogCount = entries.length;
+
+  const el = document.getElementById('agent-log');
+  el.innerHTML = entries.map(e => {
+    if (e.type === 'step')    return `<div class="log-step">📌 ${e.text}</div>`;
+    if (e.type === 'think')   return `<div class="log-think">💭 ${e.text}</div>`;
+    if (e.type === 'action')  return `<div class="log-action">▶ ${e.text}</div>`;
+    if (e.type === 'success') return `<div class="log-success">✅ ${e.text}</div>`;
+    if (e.type === 'fail')    return `<div class="log-fail">❌ ${e.text}</div>`;
+    if (e.type === 'result')  return `<div class="${e.success ? 'log-success' : 'log-fail'}">
+      ${e.success ? '🎯 ORDER COMPLETE' : '⚠️ ORDER PARTIAL'}: ${e.summary}</div>`;
+    if (e.type === 'info')    return `<div class="log-info">${e.text}</div>`;
+    return `<div class="log-info">${JSON.stringify(e)}</div>`;
+  }).join('') || '<span class="log-info">Waiting for agent...</span>';
+
+  el.scrollTop = el.scrollHeight;
+}
+
+function clearLog() {
+  logEntries   = [];
+  lastLogCount = 0;
+  document.getElementById('agent-log').innerHTML =
+    '<span class="log-info">Log cleared.</span>';
+}
+
+// ── Run order ──
+async function runOrder() {
+  const order = document.getElementById('order-input').value.trim();
+  if (!order) return;
+
+  lastLogCount = 0;
+  document.getElementById('agent-log').innerHTML =
+    `<div class="log-info">Starting: "${order}"</div>`;
+
+  try {
+    await fetch('/command', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ order })
+    });
+  } catch (e) {
+    document.getElementById('agent-log').innerHTML =
+      '<span class="log-fail">Could not connect to robot server.</span>';
+  }
+}
+
+function setOrder(text) {
+  document.getElementById('order-input').value = text;
+}
+
+function updateRunBtn(running) {
+  const btn = document.getElementById('run-btn');
+  btn.disabled   = running;
+  btn.textContent = running ? '⏳ Agent Running...' : '▶ Run Agent';
+}
+
+// ── Emergency stop ──
+async function emergencyStop() {
+  await fetch('/emergency_stop', { method: 'POST' });
+}
+
+async function resume() {
+  await fetch('/resume', { method: 'POST' });
+}
+
+// ── Reachability check ──
+async function checkReach() {
+  const x   = parseFloat(document.getElementById('reach-x').value);
+  const y   = parseFloat(document.getElementById('reach-y').value);
+  const res = await fetch(`/reachability?x=${x}&y=${y}`);
+  const d   = await res.json();
+  const el  = document.getElementById('reach-result');
+  const color = d.severity === 'ok' ? '#3fb950' :
+                d.severity === 'warning' ? '#d29922' : '#f85149';
+  el.style.color = color;
+  el.textContent = d.message;
+}
+
+// ── Start polling ──
+setInterval(pollScene, POLL_MS);
+pollScene();
+
+// ── Enter key submits ──
+document.getElementById('order-input').addEventListener('keydown', e => {
+  if (e.key === 'Enter' && e.ctrlKey) runOrder();
+});
+</script>
+</body>
+</html>

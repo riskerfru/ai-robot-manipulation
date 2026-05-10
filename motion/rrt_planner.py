@@ -33,9 +33,12 @@ class RRTPlanner:
         self.max_safe_height    = 0.80
         self.safe_height_margin = 0.15
 
-        # Robot reference for joint reconfiguration (set externally)
         self.robot = None
-        self.carrying_clearance = 0.0  # Extra buffer when holding object (set to 0.04 when carrying)
+        self.carrying_clearance = 0.0
+
+        # Verbose mode — set False to suppress strategy search prints
+        # Only final outcome prints when verbose=False
+        self.verbose = False
 
         self.logger.info("RRT Planner initialized")
 
@@ -110,58 +113,69 @@ class RRTPlanner:
         goal   = np.array(goal)
         active = self._active(ignore_name)
 
-        print(f"\n  [PLAN] {self._fmt(start)} -> {self._fmt(goal)}")
+        if self.verbose:
+            print(f"\n  [PLAN] {self._fmt(start)} -> {self._fmt(goal)}")
 
         # Strategy 1: Direct
         if self._path_clear(start, goal, active):
             print(f"  [PLAN] Strategy 1 (Direct): SUCCESS")
             return self._interpolate(start, goal), "success", []
 
-        print(f"  [PLAN] Strategy 1 (Direct): blocked")
+        if self.verbose:
+            print(f"  [PLAN] Strategy 1 (Direct): blocked")
         blocking = self._find_blocking(start, goal, active)
-        self._print_blocking(blocking)
+        if self.verbose:
+            self._print_blocking(blocking)
 
         # Strategy 2: Rise over
-        print(f"  [PLAN] Strategy 2 (Rise over)...")
+        if self.verbose:
+            print(f"  [PLAN] Strategy 2 (Rise over)...")
         path = self._strategy_rise(start, goal, active, blocking)
         if path:
             print(f"  [PLAN] Strategy 2 (Rise over): SUCCESS")
             return path, "success", []
-        print(f"  [PLAN] Strategy 2 (Rise over): failed")
+        if self.verbose:
+            print(f"  [PLAN] Strategy 2 (Rise over): failed")
 
         # Strategy 3: Expand sideways
-        print(f"  [PLAN] Strategy 3 (Expand sideways)...")
+        if self.verbose:
+            print(f"  [PLAN] Strategy 3 (Expand sideways)...")
         path = self._strategy_sideways(start, goal, active, blocking)
         if path:
             print(f"  [PLAN] Strategy 3 (Expand sideways): SUCCESS")
             return path, "success", []
-        print(f"  [PLAN] Strategy 3 (Expand sideways): failed")
+        if self.verbose:
+            print(f"  [PLAN] Strategy 3 (Expand sideways): failed")
 
         # Strategy 4: Arc around
-        print(f"  [PLAN] Strategy 4 (Arc around)...")
+        if self.verbose:
+            print(f"  [PLAN] Strategy 4 (Arc around)...")
         path = self._strategy_arc(start, goal, active, blocking)
         if path:
             print(f"  [PLAN] Strategy 4 (Arc around): SUCCESS")
             return path, "success", []
-        print(f"  [PLAN] Strategy 4 (Arc around): failed")
+        if self.verbose:
+            print(f"  [PLAN] Strategy 4 (Arc around): failed")
 
         # Strategy 5: Full RRT
-        print(f"  [PLAN] Strategy 5 (Full RRT)...")
+        if self.verbose:
+            print(f"  [PLAN] Strategy 5 (Full RRT)...")
         path, status, _ = self._rrt(start, goal, active)
         if status == "success":
             print(f"  [PLAN] Strategy 5 (Full RRT): SUCCESS")
             return path, "success", []
-        print(f"  [PLAN] Strategy 5 (Full RRT): failed")
+        if self.verbose:
+            print(f"  [PLAN] Strategy 5 (Full RRT): failed")
 
         # Strategy 6: Joint reconfiguration
-        print(f"  [PLAN] Strategy 6 (Joint reconfiguration)...")
+        if self.verbose:
+            print(f"  [PLAN] Strategy 6 (Joint reconfiguration)...")
         path = self._strategy_joint_reconfig(start, goal, active, ignore_name)
         if path:
             print(f"  [PLAN] Strategy 6 (Joint reconfiguration): SUCCESS")
             return path, "success", []
-        print(f"  [PLAN] Strategy 6 (Joint reconfiguration): failed")
 
-        print(f"  [PLAN] All strategies failed")
+        print(f"  [PLAN] All strategies failed for {self._fmt(goal)}")
         return None, "blocked", blocking
 
     # ----------------------------------------------------------
@@ -171,7 +185,6 @@ class RRTPlanner:
     def _strategy_rise(self, start, goal, active, blocking):
         safe_h = self._safe_height(blocking)
 
-        # Try increasing heights until path is clear
         for height_bonus in [0.0, 0.10, 0.20, 0.30]:
             h = safe_h + height_bonus
             waypoints = [
@@ -182,13 +195,13 @@ class RRTPlanner:
             ]
             path = self._validate(waypoints, active)
             if path:
-                if height_bonus > 0:
-                    print(f"  [PLAN] Rise succeeded at +{height_bonus:.2f}m bonus height")
+                if height_bonus > 0 and self.verbose:
+                    print(f"  [PLAN] Rise succeeded at +{height_bonus:.2f}m")
                 return path
         return None
 
     # ----------------------------------------------------------
-    # Strategy 3: Expand sideways (tries multiple angles and distances)
+    # Strategy 3: Expand sideways
     # ----------------------------------------------------------
 
     def _strategy_sideways(self, start, goal, active, blocking):
@@ -213,19 +226,18 @@ class RRTPlanner:
         mid_point  = (start_arr[:2] + goal_arr[:2]) / 2
         to_obs     = obs_center - mid_point
 
-        # Try both sides, multiple distances, multiple heights
         max_r = max(np.max(obs["size"][:2]) for obs in blocking)
 
-        for perp, side in [(perp_right if np.dot(to_obs, perp_left) > 0 
+        for perp, side in [(perp_right if np.dot(to_obs, perp_left) > 0
                             else perp_left, "primary"),
-                           (perp_left if np.dot(to_obs, perp_left) > 0 
+                           (perp_left if np.dot(to_obs, perp_left) > 0
                             else perp_right, "opposite")]:
             for expand_mult in [1.0, 1.5, 2.0, 2.5]:
                 for h_bonus in [0.0, 0.10, 0.20]:
-                    h          = safe_h + h_bonus
+                    h           = safe_h + h_bonus
                     expand_dist = max_r + 0.20 * expand_mult
-                    expand_xy  = mid_point + perp * expand_dist
-                    expand_wp  = np.array([
+                    expand_xy   = mid_point + perp * expand_dist
+                    expand_wp   = np.array([
                         np.clip(expand_xy[0], self.x_limits[0], self.x_limits[1]),
                         np.clip(expand_xy[1], self.y_limits[0], self.y_limits[1]),
                         h
@@ -240,8 +252,9 @@ class RRTPlanner:
                     ]
                     path = self._validate(waypoints, active)
                     if path:
-                        print(f"  [PLAN] Sideways {side} x{expand_mult:.1f} "
-                              f"at h={h:.2f}m succeeded")
+                        if self.verbose:
+                            print(f"  [PLAN] Sideways {side} x{expand_mult:.1f} "
+                                  f"at h={h:.2f}m")
                         return path
         return None
 
@@ -252,7 +265,7 @@ class RRTPlanner:
     def _strategy_arc(self, start, goal, active, blocking):
         if not blocking:
             return None
-        safe_h    = self._safe_height(blocking)
+        safe_h     = self._safe_height(blocking)
         obs_center = np.mean([obs["center"] for obs in blocking], axis=0)
         arc_points = self._generate_arc(
             start, goal, obs_center, safe_h, blocking, active
@@ -298,8 +311,9 @@ class RRTPlanner:
                     break
                 arc.append(arc_pt)
             if valid and arc:
-                side = "left" if np.array_equal(perp, perp_left) else "right"
-                print(f"  [PLAN] Arc on {side} ({len(arc)} waypoints)")
+                if self.verbose:
+                    side = "left" if np.array_equal(perp, perp_left) else "right"
+                    print(f"  [PLAN] Arc on {side} ({len(arc)} waypoints)")
                 return arc
         return None
 
@@ -308,11 +322,6 @@ class RRTPlanner:
     # ----------------------------------------------------------
 
     def plan_transport(self, start, goal, ignore_name=None):
-        """
-        Special planning for when robot is carrying an object.
-        Tries approach angles that maximise clearance from obstacles.
-        Falls back to normal plan() if nothing better found.
-        """
         start  = np.array(start)
         goal   = np.array(goal)
         active = self._active(ignore_name)
@@ -320,14 +329,12 @@ class RRTPlanner:
         if not active:
             return self.plan(start, goal, ignore_name)
 
-        print(f"  [TRANSPORT] Finding max-clearance path...")
+        if self.verbose:
+            print(f"  [TRANSPORT] Finding max-clearance path...")
 
-        # Try multiple intermediate waypoints at different angles
-        # around the workspace to find path with most obstacle clearance
         best_path      = None
         best_clearance = -1.0
 
-        # Generate candidate via-points in a circle around midpoint
         mid    = (start + goal) / 2
         radius = np.linalg.norm(goal - start) * 0.6
 
@@ -346,7 +353,6 @@ class RRTPlanner:
             path = self._validate(waypoints, active)
 
             if path:
-                # Calculate minimum clearance from obstacles along path
                 min_clear = self._path_min_clearance(path, active)
                 if min_clear > best_clearance:
                     best_clearance = min_clear
@@ -356,14 +362,13 @@ class RRTPlanner:
             print(f"  [TRANSPORT] Best path clearance: {best_clearance:.3f}m")
             return best_path, "success", []
 
-        # Fall back to normal planning
-        print(f"  [TRANSPORT] No clear angle found - using standard planner")
+        if self.verbose:
+            print(f"  [TRANSPORT] No clear angle found - using standard planner")
         return self.plan(start, goal, ignore_name)
 
     def _path_min_clearance(self, path, obstacles):
-        """Calculate minimum distance from any obstacle along path"""
         min_dist = float("inf")
-        for point in path[::5]:  # Sample every 5th point for speed
+        for point in path[::5]:
             point = np.array(point)
             for obs in obstacles:
                 dist = np.linalg.norm(point - obs["center"]) - np.max(obs["size"])
@@ -371,39 +376,22 @@ class RRTPlanner:
                     min_dist = dist
         return max(0.0, min_dist)
 
+    # ----------------------------------------------------------
     # Strategy 6: Joint Reconfiguration
-    # Moves individual joints to change arm pose, then retries
-    # This exploits the 7-DOF redundancy of Franka Panda
     # ----------------------------------------------------------
 
     def _strategy_joint_reconfig(self, start, goal, active, ignore_name):
-        """
-        Try different arm configurations by adjusting joints
-        while keeping end effector near the same workspace.
-        
-        Configurations to try:
-        - Elbow up (joint 4 more negative)
-        - Elbow down (joint 4 more positive)  
-        - Arm tucked in (joint 3 rotated)
-        - Arm extended out (joint 3 other way)
-        - Base rotated left
-        - Base rotated right
-        - Wrist flip (joint 6)
-        """
         if self.robot is None:
-            print(f"  [RECONFIG] No robot reference - skipping")
             return None
 
         import pybullet as p
+        import time
 
-        # Save current joint states
         saved_joints = []
         for joint_idx in self.robot.arm_joints:
             state = p.getJointState(self.robot.robot, joint_idx)
             saved_joints.append(state[0])
 
-        # Define configurations to try
-        # Each is a dict of {joint_index_in_arm: delta_radians}
         configs = [
             {"name": "elbow up",       "joints": {3: -0.5}},
             {"name": "elbow down",     "joints": {3:  0.5}},
@@ -421,18 +409,15 @@ class RRTPlanner:
             {"name": "high reach",     "joints": {1: -0.5, 3: -0.8}},
         ]
 
-        import time
-
         for config in configs:
-            print(f"  [RECONFIG] Trying '{config['name']}'...")
+            if self.verbose:
+                print(f"  [RECONFIG] Trying '{config['name']}'...")
 
-            # Apply joint deltas
             new_joints = list(saved_joints)
             for arm_idx, delta in config["joints"].items():
                 if arm_idx < len(new_joints):
                     new_joints[arm_idx] = saved_joints[arm_idx] + delta
 
-            # Apply joints
             for i, joint_idx in enumerate(self.robot.arm_joints):
                 p.setJointMotorControl2(
                     self.robot.robot, joint_idx,
@@ -442,23 +427,20 @@ class RRTPlanner:
                     maxVelocity=2.0
                 )
 
-            # Let simulation settle briefly
             for _ in range(80):
                 p.stepSimulation()
                 time.sleep(self.robot.sim_config["timestep"])
 
-            # Get new end effector position after reconfiguration
             new_ee = np.array(self.robot.get_end_effector_position())
 
-            print(f"  [RECONFIG] New EE position: {self._fmt(new_ee)}")
+            if self.verbose:
+                print(f"  [RECONFIG] New EE position: {self._fmt(new_ee)}")
 
-            # Now try all path strategies from new position
             if self._path_clear(new_ee, goal, active):
-                print(f"  [RECONFIG] Direct path clear from new config!")
+                print(f"  [RECONFIG] '{config['name']}' → direct path clear")
                 path = self._interpolate(new_ee, goal)
                 return path
 
-            # Try rise over from new position
             blocking_new = self._find_blocking(new_ee, goal, active)
             safe_h = self._safe_height(blocking_new) if blocking_new \
                 else self.min_safe_height
@@ -471,19 +453,17 @@ class RRTPlanner:
             ]
             path = self._validate(rise_waypoints, active)
             if path:
-                print(f"  [RECONFIG] Rise-over path found from '{config['name']}'!")
+                print(f"  [RECONFIG] '{config['name']}' → rise-over path found")
                 return path
 
-            # Try sideways from new position
             path = self._strategy_sideways(
                 new_ee, goal, active, blocking_new or []
             )
             if path:
-                print(f"  [RECONFIG] Sideways path found from '{config['name']}'!")
+                print(f"  [RECONFIG] '{config['name']}' → sideways path found")
                 return path
 
-        # Restore original joints if nothing worked
-        print(f"  [RECONFIG] All configurations failed - restoring original")
+        # Restore original joints
         for i, joint_idx in enumerate(self.robot.arm_joints):
             p.setJointMotorControl2(
                 self.robot.robot, joint_idx,
@@ -523,14 +503,15 @@ class RRTPlanner:
         else:
             expand_dir = perp_left
             side = "left"
-        max_r      = max(np.max(obs["size"][:2]) for obs in blocking) + 0.20
-        expand_xy  = mid_point + expand_dir * max_r
-        expand_pos = np.array([
+        max_r       = max(np.max(obs["size"][:2]) for obs in blocking) + 0.20
+        expand_xy   = mid_point + expand_dir * max_r
+        expand_pos  = np.array([
             np.clip(expand_xy[0], self.x_limits[0], self.x_limits[1]),
             np.clip(expand_xy[1], self.y_limits[0], self.y_limits[1]),
             safe_h
         ])
-        print(f"  [PLAN] Expand {side}: {self._fmt(expand_pos)}")
+        if self.verbose:
+            print(f"  [PLAN] Expand {side}: {self._fmt(expand_pos)}")
         return expand_pos
 
     def _validate(self, waypoints, active):
@@ -554,8 +535,7 @@ class RRTPlanner:
         if not blocking:
             return self.min_safe_height
         max_top = max(obs["center"][2] + obs["size"][2] for obs in blocking)
-        # Add extra margin when carrying (carrying_clearance > 0)
-        margin = self.safe_height_margin + self.carrying_clearance
+        margin  = self.safe_height_margin + self.carrying_clearance
         return float(np.clip(
             max_top + margin,
             self.min_safe_height,
@@ -576,26 +556,17 @@ class RRTPlanner:
                 f"{float(p[2]):.2f})")
 
     # ----------------------------------------------------------
-    # RRT fallback
+    # RRT* fallback
     # ----------------------------------------------------------
 
     def _rrt(self, start, goal, active, max_iter=None):
-        """
-        RRT* - Optimal RRT.
-        Finds shortest path by rewiring tree toward lower cost nodes.
-        Same as RRT but every new node checks if nearby nodes
-        can be reached cheaper through it - and rewires if so.
-        """
         if max_iter is None:
             max_iter = self.max_iterations
         start = np.array(start)
         goal  = np.array(goal)
 
-        # Each node: pos, parent, cost
         root = {"pos": start, "parent": None, "cost": 0.0}
         tree = [root]
-
-        # Rewire radius - search nearby nodes within this distance
         rewire_radius = self.step_size * 2.5
 
         for iteration in range(max_iter):
@@ -608,13 +579,7 @@ class RRTPlanner:
             if not self._path_clear(nearest["pos"], new_pos, active):
                 continue
 
-            # Cost to reach new node via nearest
-            new_cost = nearest["cost"] + np.linalg.norm(
-                new_pos - nearest["pos"]
-            )
-
-            # RRT* REWIRING: find nearby nodes
-            # Check if any nearby node gives cheaper path to new_pos
+            new_cost    = nearest["cost"] + np.linalg.norm(new_pos - nearest["pos"])
             best_parent = nearest
             best_cost   = new_cost
 
@@ -627,16 +592,9 @@ class RRTPlanner:
                         best_parent = node
                         best_cost   = candidate_cost
 
-            # Add new node with best parent
-            new_node = {
-                "pos":    new_pos,
-                "parent": best_parent,
-                "cost":   best_cost
-            }
+            new_node = {"pos": new_pos, "parent": best_parent, "cost": best_cost}
             tree.append(new_node)
 
-            # RRT* REWIRING: check if existing nearby nodes
-            # are cheaper to reach through new_node
             for node in tree:
                 if node is new_node or node is root:
                     continue
@@ -648,12 +606,12 @@ class RRTPlanner:
                         node["parent"] = new_node
                         node["cost"]   = new_cost_via
 
-            # Check if goal reached
             if np.linalg.norm(new_pos - goal) < self.goal_threshold:
                 path = self._extract(tree, new_node, goal)
-                cost = round(new_node["cost"], 3)
-                print(f"  [RRT*] Found path: cost={cost}, "
-                      f"iter={iteration}, nodes={len(tree)}")
+                if self.verbose:
+                    cost = round(new_node["cost"], 3)
+                    print(f"  [RRT*] Found path: cost={cost}, "
+                          f"iter={iteration}, nodes={len(tree)}")
                 if self.smooth:
                     path = self._smooth(path, active)
                 return path, "success", []
@@ -671,7 +629,6 @@ class RRTPlanner:
                 self.z_limits[0] <= point[2] <= self.z_limits[1]):
             return False
         for obs in obstacles:
-            # Use larger buffer for walls when carrying, normal for objects
             if self.carrying_clearance > 0 and not obs["name"].startswith("obj_"):
                 buffer = 0.05 + self.carrying_clearance
             else:
@@ -755,5 +712,6 @@ class RRTPlanner:
                 j -= 1
             smoothed.append(path[j])
             i = j
-        print(f"  [PLAN] Smoothed: {len(path)} -> {len(smoothed)} waypoints")
+        if self.verbose:
+            print(f"  [PLAN] Smoothed: {len(path)} -> {len(smoothed)} waypoints")
         return smoothed

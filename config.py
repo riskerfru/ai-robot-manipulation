@@ -36,7 +36,7 @@ CUSTOM_URDF_PATH = ""  # e.g. "C:/robots/my_robot.urdf"
 # --------------------------------------------------------------
 SIM_GRAVITY         = -9.81
 SIM_TIMESTEP        = 1 / 240
-SIM_STEPS_PER_MOVE  = 300
+SIM_STEPS_PER_MOVE  = 150
 SIM_GUI             = True       # False = headless (no window)
 
 # --------------------------------------------------------------

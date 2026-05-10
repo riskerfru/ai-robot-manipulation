@@ -121,10 +121,6 @@ class FrankaPandaRobot:
     # ----------------------------------------------------------
 
     def open_gripper(self):
-        """
-        Vacuum gripper — open means suction OFF.
-        Keep fingers visually open (wide) for aesthetics.
-        """
         if not self.finger_joints:
             return
         for joint in self.finger_joints:
@@ -135,142 +131,17 @@ class FrankaPandaRobot:
             )
 
     def close_gripper(self):
-        """
-        Vacuum gripper — close means suction ON.
-        Fingers stay open visually — suction is simulated
-        purely through the constraint in pick_object.
-        We keep fingers slightly open to show it's a vacuum cup.
-        """
         if not self.finger_joints:
             return
-        # Keep fingers open — vacuum doesn't squeeze
         for joint in self.finger_joints:
             p.setJointMotorControl2(
                 self.robot, joint,
                 p.POSITION_CONTROL,
-                targetPosition=0.035, force=5  # slightly open = vacuum cup pose
+                targetPosition=0.01, force=10
             )
-        # Brief settle — no long wait needed (no mechanical closing)
-        for _ in range(30):
+        for _ in range(200):
             p.stepSimulation()
             time.sleep(self.sim_config["timestep"])
-
-    def vacuum_attach(self, name):
-        """
-        Vacuum suction — attach object rigidly to end effector.
-        Object stays WHERE IT IS — gripper has descended to it.
-        Constraint keeps the object at current relative position.
-        """
-        obj_id  = self.objects[name]["id"]
-        obj_pos = self.get_object_position(name)
-        ee_pos  = self.get_end_effector_position()
-
-        # Calculate actual offset between EE and object right now
-        # This preserves the current relative position — no jerking
-        offset_z = obj_pos[2] - ee_pos[2] if obj_pos and ee_pos else -0.04
-
-        constraint = p.createConstraint(
-            parentBodyUniqueId=self.robot,
-            parentLinkIndex=self.end_effector,
-            childBodyUniqueId=obj_id,
-            childLinkIndex=-1,
-            jointType=p.JOINT_FIXED,
-            jointAxis=[0, 0, 0],
-            parentFramePosition=[0, 0, 0],          # at EE centre
-            childFramePosition=[0, 0, -offset_z]    # object relative to EE
-        )
-        p.changeConstraint(constraint, maxForce=200)
-        return constraint
-
-    def vacuum_release(self):
-        """
-        Vacuum release — remove constraint.
-        Object stays exactly where it is — no drop, no roll.
-        """
-        if self.grasp_constraint is not None:
-            p.removeConstraint(self.grasp_constraint)
-            self.grasp_constraint = None
-
-        # Settle — let physics confirm object is resting
-        for _ in range(150):
-            p.stepSimulation()
-            time.sleep(self.sim_config["timestep"])
-
-    # ----------------------------------------------------------
-    # Scene management
-    # ----------------------------------------------------------
-
-    def add_object(self, name, x, y, color, z=0.05):
-        col    = p.createCollisionShape(p.GEOM_BOX, halfExtents=[0.04, 0.04, 0.04])
-        vis    = p.createVisualShape(p.GEOM_BOX, halfExtents=[0.04, 0.04, 0.04], rgbaColor=color)
-        obj_id = p.createMultiBody(
-            baseMass=0.1,
-            baseCollisionShapeIndex=col,
-            baseVisualShapeIndex=vis,
-            basePosition=[x, y, z]
-        )
-        self.objects[name] = {"id": obj_id, "color": color, "position": [x, y, z]}
-        self.logger.info(f"Added object '{name}' at ({x}, {y}, {z})")
-        self._sync_obstacles()
-        return obj_id
-
-    def add_obstacle(self, name, x, y, size, color=[0.5, 0.5, 0.5, 0.9], z=0.0):
-        col       = p.createCollisionShape(p.GEOM_BOX, halfExtents=size)
-        vis       = p.createVisualShape(p.GEOM_BOX, halfExtents=size, rgbaColor=color)
-        center_z  = z + size[2]
-        obj_id    = p.createMultiBody(
-            baseMass=0,
-            baseCollisionShapeIndex=col,
-            baseVisualShapeIndex=vis,
-            basePosition=[x, y, center_z]
-        )
-        self.obstacles[name] = {"id": obj_id, "position": [x, y, center_z], "size": size}
-        self.rrt.add_obstacle(center=(x, y, center_z), size=size, name=name)
-        self.logger.info(f"Added obstacle '{name}' at ({x}, {y}, {center_z})")
-        return obj_id
-
-    def remove_obstacle(self, name):
-        if name in self.obstacles:
-            p.removeBody(self.obstacles[name]["id"])
-            del self.obstacles[name]
-            self.rrt.obstacles = [o for o in self.rrt.obstacles if o["name"] != name]
-            self.logger.info(f"Removed obstacle '{name}'")
-        else:
-            print(f"  Obstacle '{name}' not found")
-
-    def list_obstacles(self):
-        if not self.obstacles:
-            print("\n  No obstacles in scene.")
-            return
-        print("\n  Current obstacles:")
-        for name, data in self.obstacles.items():
-            pos = data["position"]
-            print(f"    {name}: ({pos[0]:.2f}, {pos[1]:.2f}, {pos[2]:.2f})")
-
-    def _sync_obstacles(self, ignore_object=None):
-        objects_for_rrt = {
-            name: self.get_object_position(name)
-            for name in self.objects
-            if name != ignore_object
-        }
-        self.rrt.update_obstacles_from_objects(objects_for_rrt)
-
-    def get_object_position(self, name):
-        if name not in self.objects:
-            return None
-        pos, _ = p.getBasePositionAndOrientation(self.objects[name]["id"])
-        return pos
-
-    def get_all_object_positions(self):
-        return {name: self.get_object_position(name) for name in self.objects}
-
-    # ----------------------------------------------------------
-    # Camera
-    # ----------------------------------------------------------
-
-    def scan_scene(self):
-        self.logger.info("Scanning scene...")
-        return self.camera.detect_objects(self.objects, "overhead")
 
     def get_end_effector_position(self):
         return p.getLinkState(self.robot, self.end_effector)[0]
@@ -503,8 +374,16 @@ class FrankaPandaRobot:
                 "detail": f"cannot reach above '{name}' — RRT failed"
             }
 
-        print(f"  [PICK] Above target - visual servoing...")
+        # Visual servo: approach using known position, refine with camera
+        # Known position gets gripper within ~5mm, servo corrects the rest
+        print(f"  [PICK] Visual servoing for fine alignment...")
         aligned_x, aligned_y = self.servo.servo_to_object(self, name)
+        
+        # Safety: if servo drifted more than 3cm from known position, use known
+        drift = math.sqrt((aligned_x - pos[0])**2 + (aligned_y - pos[1])**2)
+        if drift > 0.03:
+            print(f"  [PICK] Servo drift {drift*100:.1f}cm — falling back to known position")
+            aligned_x, aligned_y = pos[0], pos[1]
 
         print(f"  [PICK] Descending...")
         self._direct_move(aligned_x, aligned_y,
@@ -596,7 +475,7 @@ class FrankaPandaRobot:
             place_z   = (stack_pos[2] + 0.05) if stack_pos else 0.18
             print(f"  [PLACE] Stacking on '{stack_on}' — descend to z={place_z:.3f}")
         else:
-            place_z = 0.15   # table surface 0.10 + object half 0.04 + 1cm gap
+            place_z = 0.12   # table surface 0.10 + small gap — object already touching
 
         # Fast approach
         self._direct_move(x, y, place_z + 0.10, speed_factor=0.4)

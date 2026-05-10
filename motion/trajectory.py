@@ -22,7 +22,7 @@ class TrajectoryPlanner:
         self.config = config
         self.logger = logger
 
-        self.trajectory_points = config.get("trajectory_points", 50)
+        self.trajectory_points = config.get("trajectory_points", 30)
         self.max_velocity      = config.get("max_velocity", 1.0)
         self.max_acceleration  = config.get("max_acceleration", 0.5)
 
