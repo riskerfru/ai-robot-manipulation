@@ -6,6 +6,10 @@ A simulation of an AI-powered robot manipulation system built with PyBullet, fea
 
 ## Demo
 
+[![AI Robot Demo](https://img.youtube.com/vi/woKWzid6joI/0.jpg)](https://www.youtube.com/watch?v=woKWzid6joI)
+
+*Autonomous warehouse agent completing a full dispatch order — 6/6 subtasks in under 10 action steps*
+
 **Autonomous warehouse order fulfilment — all 6/6 subtasks completed:**
 
 ```
