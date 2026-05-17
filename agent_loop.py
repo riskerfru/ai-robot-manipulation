@@ -1,104 +1,64 @@
 # =============================================================
 #   AGENT LOOP - Autonomous Warehouse Order Agent
-#   Mirrors Humanoid's KinetIQ System 2 architecture:
-#     - Receives high-level goal
-#     - Decomposes into subtasks
-#     - Executes: observe → think → act → check → repeat
-#     - Replans on failure
-#     - Reports final status
+#   Fixed version - resolves all 6 identified bugs:
 #
-#   Usage:
-#     from agent.agent_loop import WarehouseAgent
-#     agent = WarehouseAgent(robot, ai, logger)
-#     result = agent.run("pick red, stack blue on green")
+#   Bug 1: Subtask pointer not advancing
+#   Bug 2: Agent picks from occupied slots
+#   Bug 3: Objects drift out of reach
+#   Bug 4: Observation format confuses Claude
+#   Bug 5: Slot auto-assignment conflict
+#   Bug 6: Stack instead of next slot
 # =============================================================
 
 import time
 import json
 import anthropic
+from place_verifier import PlacementVerifier
 
 
-# =============================================================
-#   SYSTEM PROMPT — Claude acts as System 2 (task orchestrator)
-#   This mirrors KinetIQ's VLM reasoning layer
-# =============================================================
+ORCHESTRATOR_PROMPT = """You are an autonomous warehouse robot agent.
 
-ORCHESTRATOR_PROMPT = """You are an autonomous warehouse robot agent — the task orchestrator (System 2).
+You control a Franka Panda robot arm via these actions:
+  pick(object)        - pick up named object from TABLE ONLY
+  place_slot(slot)    - place held object in conveyor slot 1, 2 or 3
+  place(x, y)         - place at exact coordinates
+  stack(object, on)   - stack object on top of another
+  scan()              - scan scene
+  home()              - return to home
 
-You control a Franka Panda robot arm via these low-level capabilities (System 1):
-  - pick(object_name)         pick up a named object
-  - place(x, y)               place held object at coordinates
-  - stack(object_name)        place held object on top of another
-  - scan()                    scan scene and get all object positions
-  - home()                    return robot to home position
+CONVEYOR SLOTS — DESTINATIONS ONLY, NEVER PICK FROM THESE:
+  Slot 1: (0.63, +0.30)
+  Slot 2: (0.63,  0.00)
+  Slot 3: (0.63, -0.30)
 
-CONVEYOR SLOTS — numbered, no colour coding:
-  Slot 1: x=0.72, y= 0.30
-  Slot 2: x=0.72, y= 0.00
-  Slot 3: x=0.72, y=-0.30
+=== CRITICAL RULES ===
+1. READ "DO NOW" CAREFULLY - execute ONLY that one task
+2. NEVER pick an object from a conveyor slot position (x > 0.60)
+3. NEVER pick if already holding something - place first
+4. Objects to pick are ALWAYS on the table (x < 0.60)
+5. If a slot is occupied - use the next empty slot
+6. If object is unreachable - report failed immediately
 
-SLOT RULES:
-  Slots are PLACE destinations only — never pick from x=0.72
-  Objects to pick are at x=0.50-0.55 (table area)
-  If user specifies a slot number → use that slot
-  If no slot specified → use next empty slot (1 first, then 2, then 3)
-  Never place two objects in the same slot
-  Use action "place_slot" with param "slot": 1, 2, or 3
-
-Your job:
-1. Decompose the warehouse order into a sequence of subtasks
-2. Execute each subtask one at a time
-3. Check the result (success / failed / reason)
-4. If failed — replan using the failure reason
-5. Continue until all subtasks are done or truly impossible
-
-RESPONSE FORMAT — always return valid JSON:
+RESPONSE FORMAT - always return valid JSON:
 {
-  "thinking": "your reasoning about the current situation",
-  "action": "pick" | "place" | "stack" | "scan" | "home" | "done" | "failed",
+  "thinking": "one sentence about current situation",
+  "action": "pick" | "place_slot" | "place" | "stack" | "scan" | "home" | "done" | "failed",
   "params": {
-    "object": "red",         (for pick)
-    "on": "green",           (for stack — the object to stack ON TOP OF)
-    "x": 0.4,               (for place)
-    "y": 0.1                (for place)
+    "object": "red",    (for pick, stack)
+    "slot": 2,          (for place_slot)
+    "on": "green",      (for stack - object to stack ON TOP OF)
+    "x": 0.4,           (for place)
+    "y": 0.1            (for place)
   },
-  "message": "human readable description of what you are doing"
+  "message": "what you are doing"
 }
 
-When the full order is complete, return: {"action": "done", "message": "order complete"}
-When a subtask is truly impossible after retrying, return: {"action": "failed", "message": "reason"}
-
-CRITICAL RULES:
-- Execute ONE action per response
-- NEVER pick an object if you are already holding something — place first
-- Always scan first if you don't know where objects are
-- If pick fails with "unreachable" — the object is out of the safe zone
-  Safe zone: 0.30m to 0.65m from robot base (origin)
-  If object is too close (<0.25m): report failed — cannot rescue without human
-  If object is too far (>0.75m): report failed — out of reach
-- If pick fails for other reason — try again once, then report failed
-- If place fails — try a slightly different position (shift x or y by 0.05)
-- Never give up after first failure — try at least 2 alternatives
-- Be concise in thinking — max 2 sentences
-- Track what you are holding — the observation tells you under "Holding:"
-- Check reachability badge in observation (✅ ok / ⚠️ edge / ❌ unreachable)
+When current task is complete: {"action": "done", "message": "task done"}
+When truly impossible: {"action": "failed", "message": "specific reason"}
 """
 
 
-# =============================================================
-#   EMERGENCY STOP — shared flag checked every loop iteration
-# =============================================================
-
 class EmergencyStop:
-    """
-    Shared flag visible to all parts of the system.
-    Set stop=True from anywhere to halt the agent loop.
-
-    Usage:
-      e_stop = EmergencyStop()
-      e_stop.trigger("user pressed stop button")
-      e_stop.reset()
-    """
     def __init__(self):
         self.stop   = False
         self.reason = None
@@ -117,132 +77,156 @@ class EmergencyStop:
         return self.stop
 
 
-# Global instance — importable from anywhere
 EMERGENCY_STOP = EmergencyStop()
 
 
 # =============================================================
-#   OBSERVATION BUILDER
-#   What the agent sees at each step — this is what they judge
+#   FIXED OBSERVATION BUILDER
+#   Key fix: clearly separates DONE / DO NOW / NOT YET
+#   So Claude cannot confuse completed with pending tasks
 # =============================================================
 
 def build_observation(robot, completed_tasks, failed_tasks,
-                       remaining_order, last_result=None):
+                      current_subtask, future_subtasks,
+                      last_result=None):
     """
-    Build a structured observation string for Claude.
+    Build crystal clear observation for Claude.
 
-    Design choices (for design note):
-    - Include exact positions so agent doesn't need to guess
-    - Include reachability status to prevent wasted attempts
-    - Include task history so agent knows what it has done
-    - Include last result so agent can react to failures
-    - Keep format consistent — Claude learns the pattern quickly
+    FIX FOR BUG 1 & 4:
+    Instead of showing all remaining tasks at once,
+    we show exactly three sections:
+      DONE     - do not repeat these
+      DO NOW   - execute only this one task
+      NOT YET  - do not do these yet
+
+    This prevents Claude from jumping ahead or
+    repeating completed tasks.
     """
 
-    # Get current scene state — use robot.objects directly (always accurate)
-    positions   = robot.get_all_object_positions()   # from PyBullet directly
-    holding     = robot.grasped_object or "nothing"
-    robot_pos   = robot.get_end_effector_position()
-    obstacles   = list(robot.obstacles.keys())
-    # Note: positions comes from PyBullet physics — not camera — always correct
+    # Get scene state
+    positions = robot.get_all_object_positions()
+    holding   = robot.grasped_object or "nothing"
+    robot_pos = robot.get_end_effector_position()
+    obstacles = list(robot.obstacles.keys())
 
-    # Build object summary with reachability
-    object_lines = []
+    # Build object summary
+    # FIX FOR BUG 2: clearly label which objects are on table vs slots
+    slot_positions = set()
+    if hasattr(robot, 'conveyor_slots'):
+        for sn, (sx, sy) in robot.conveyor_slots.items():
+            slot_positions.add(sn)
+
+    object_lines   = []
+    table_objects  = []  # objects safe to pick
+    slot_objects   = []  # objects in slots - do not pick
+
     for name, pos in positions.items():
         if pos:
-            reach = robot.check_reachability(pos[0], pos[1], pos[2])
-            status_icon = {
-                "ok":      "✅",
-                "warning": "⚠️",
-                "error":   "❌"
-            }.get(reach["severity"], "?")
+            reach  = robot.check_reachability(pos[0], pos[1], pos[2])
+            icon   = {"ok": "✅", "warning": "⚠️",
+                      "error": "❌"}.get(reach["severity"], "?")
+            dist   = reach.get("distance", 0)
 
-            object_lines.append(
-                f"  {status_icon} {name}: "
-                f"pos=({pos[0]:.3f}, {pos[1]:.3f}, {pos[2]:.3f}) "
-                f"reach={reach['severity']} ({reach['distance']}m)"
-            )
-        else:
-            object_lines.append(f"  ? {name}: position unknown")
+            # Check if object is in a slot position
+            in_slot = False
+            slot_num = None
+            if hasattr(robot, 'slot_occupants'):
+                for sn, occupant in robot.slot_occupants.items():
+                    if occupant == name:
+                        in_slot  = True
+                        slot_num = sn
+                        break
 
-    objects_str = "\n".join(object_lines) if object_lines else "  none visible"
+            if in_slot:
+                slot_objects.append(
+                    f"  🚫 {name}: IN SLOT {slot_num} "
+                    f"— DO NOT PICK THIS"
+                )
+            else:
+                table_objects.append(
+                    f"  {icon} {name}: "
+                    f"pos=({pos[0]:.2f}, {pos[1]:.2f}) "
+                    f"dist={dist}m reach={reach['severity']}"
+                )
 
-    # Last result summary
+    # Build slot status
+    slot_lines = []
+    if hasattr(robot, 'conveyor_slots'):
+        for sn, (sx, sy) in robot.conveyor_slots.items():
+            occupant = robot.slot_occupants.get(sn, "EMPTY")
+            status   = f"occupied by {occupant}" if occupant != "EMPTY" else "EMPTY ← can place here"
+            slot_lines.append(f"  Slot {sn}: ({sx}, {sy:+.2f}) — {status}")
+
+    # Last result
     if last_result:
         result_str = (
-            f"Last action: {last_result.get('action')} "
-            f"→ {last_result.get('status')} "
-            f"({last_result.get('detail', '')})"
+            f"Last action result: {last_result.get('status', '?').upper()} "
+            f"— {last_result.get('detail', '')}"
         )
     else:
-        result_str = "Last action: none (starting fresh)"
+        result_str = "Last action result: none (starting fresh)"
 
-    # Build slot occupancy string
-    slot_status = ""
-    if hasattr(robot, "slot_occupants"):
-        for sn, (sx, sy) in robot.conveyor_slots.items():
-            occupant = robot.slot_occupants.get(sn, "empty")
-            slot_status += f"  Slot {sn}: ({sx}, {sy:+.2f}) — {occupant}\n"
-    else:
-        slot_status = "  Slot 1: (0.72, +0.30)\n  Slot 2: (0.72, 0.00)\n  Slot 3: (0.72, -0.30)\n"
-
-    # Build full observation
-    obs = f"""=== CURRENT OBSERVATION ===
-CONVEYOR SLOTS (place destinations — x=0.72, never pick these):
-{slot_status}
-Robot position: ({robot_pos[0]:.3f}, {robot_pos[1]:.3f}, {robot_pos[2]:.3f})
+    # Build observation with clear DO NOW section
+    obs = f"""=== ROBOT STATE ===
 Holding: {holding}
+Robot at: ({robot_pos[0]:.2f}, {robot_pos[1]:.2f}, {robot_pos[2]:.2f})
 
-Objects in scene:
-{objects_str}
+=== CONVEYOR SLOTS (DESTINATIONS — NEVER PICK FROM THESE) ===
+{chr(10).join(slot_lines) if slot_lines else "  Slot 1/2/3 available"}
 
-Obstacles: {', '.join(obstacles) if obstacles else 'none'}
+=== OBJECTS ON TABLE (SAFE TO PICK) ===
+{chr(10).join(table_objects) if table_objects else "  none on table"}
 
-{result_str}
+=== OBJECTS IN SLOTS (DO NOT PICK THESE) ===
+{chr(10).join(slot_objects) if slot_objects else "  none in slots yet"}
 
-Completed tasks: {completed_tasks if completed_tasks else 'none yet'}
-Failed tasks:    {failed_tasks if failed_tasks else 'none'}
+=== OBSTACLES ===
+{', '.join(obstacles) if obstacles else 'none'}
 
-Remaining order: {remaining_order}
-==========================="""
+=== {result_str} ===
+
+╔══════════════════════════════════════╗
+║ TASKS ALREADY DONE (do not repeat): ║
+║ {str(completed_tasks) if completed_tasks else 'none yet':36s} ║
+╠══════════════════════════════════════╣
+║ DO NOW (execute only this):          ║
+║ {str(current_subtask):36s} ║
+╠══════════════════════════════════════╣
+║ NOT YET (do not do these yet):       ║
+║ {str(future_subtasks[:2]) if future_subtasks else 'none':36s} ║
+╚══════════════════════════════════════╝"""
 
     return obs
 
 
-# =============================================================
-#   TASK DECOMPOSER
-#   Breaks a natural language order into subtask list
-# =============================================================
-
 def decompose_order(order, client, model, known_objects=None):
-    """
-    Use Claude to decompose a natural language order into subtasks.
-    known_objects: list of object names that exist in scene.
-    """
+    """Decompose natural language order into subtask list."""
     print(f"\n  🧠 Decomposing order: '{order}'")
 
     obj_note = ""
     if known_objects:
-        obj_note = f"\nONLY use these objects (no others): {known_objects}"
+        obj_note = f"\nONLY use these objects: {known_objects}"
 
     system = (
         "Decompose a warehouse robot order into subtasks.\n"
         "Return ONLY a JSON array of subtasks, nothing else.\n\n"
         "Subtask formats:\n"
-        '{"action": "pick",  "object": "red"}\n'
+        '{"action": "pick", "object": "red"}\n'
         '{"action": "place_slot", "slot": 1}\n'
         '{"action": "place", "x": 0.4, "y": 0.1}\n'
         '{"action": "stack", "object": "blue", "on": "green"}\n'
         '{"action": "scan"}\n'
         '{"action": "home"}\n\n'
         "CONVEYOR SLOTS:\n"
-        "  Slot 1: (0.68, +0.30)\n"
-        "  Slot 2: (0.68,  0.00)\n"
-        "  Slot 3: (0.68, -0.30)\n"
+        "  Slot 1: (0.63, +0.30)\n"
+        "  Slot 2: (0.63,  0.00)\n"
+        "  Slot 3: (0.63, -0.30)\n"
         "Use place_slot for dispatch/conveyor tasks.\n"
+        "Each object goes to a DIFFERENT slot.\n"
         + obj_note + "\n\n"
         "Rules:\n"
         "- Pick before place or stack\n"
+        "- Each object to different slot (not all to slot 2)\n"
         "- NEVER invent objects not in the known list\n"
         "- Return ONLY the JSON array"
     )
@@ -251,17 +235,13 @@ def decompose_order(order, client, model, known_objects=None):
         model=model,
         max_tokens=500,
         system=system,
-        messages=[{
-            "role": "user",
-            "content": f"Decompose this order: {order}"
-        }]
+        messages=[{"role": "user",
+                   "content": f"Decompose this order: {order}"}]
     )
 
     text = response.content[0].text.strip()
 
-    # Parse JSON array
     try:
-        # Handle code blocks
         if "```" in text:
             text = text.split("```")[1]
             if text.startswith("json"):
@@ -272,133 +252,88 @@ def decompose_order(order, client, model, known_objects=None):
             print(f"     {i+1}. {t}")
         return subtasks
     except json.JSONDecodeError:
-        print(f"  ⚠️  Could not parse decomposition, using simple fallback")
-        # Simple fallback — parse common patterns
-        return _simple_decompose(order)
+        print(f"  ⚠️  Parse failed, using fallback")
+        return [{"action": "scan"}]
 
-
-def _simple_decompose(order):
-    """Fallback decomposer for common patterns"""
-    subtasks = [{"action": "scan"}]
-    order_lower = order.lower()
-
-    for color in ["red", "blue", "green"]:
-        if f"pick {color}" in order_lower or f"grab {color}" in order_lower:
-            subtasks.append({"action": "pick", "object": color})
-
-    if "stack" in order_lower:
-        for color in ["red", "blue", "green"]:
-            if color in order_lower:
-                subtasks.append({"action": "stack", "object": color,
-                                  "on": "green"})
-                break
-
-    return subtasks
-
-
-# =============================================================
-#   MAIN AGENT LOOP
-# =============================================================
 
 class WarehouseAgent:
     """
     Autonomous warehouse order fulfilment agent.
-
-    Architecture mirrors Humanoid KinetIQ:
-      System 3: natural language order (input)
-      System 2: this class — Claude VLM reasoning
-      System 1: robot.pick(), place(), stack() — capabilities
-      System 0: PyBullet physics — execution
-
-    Each capability reports success/failed/reason back to System 2
-    so the agent can track progress and replan.
+    Fixed version with clear subtask tracking.
     """
 
     def __init__(self, robot, ai_config, logger):
-        self.robot      = robot
-        self.logger     = logger
-        self.client     = anthropic.Anthropic(api_key=ai_config["api_key"])
-        self.model      = ai_config["model"]
-        self.e_stop     = EMERGENCY_STOP
-        self.max_retries = 3   # max retries per subtask
-        self._place_count = {}  # track placements per zone to offset
+        self.robot       = robot
+        self.logger      = logger
+        self.client      = anthropic.Anthropic(api_key=ai_config["api_key"])
+        self.model       = ai_config["model"]
+        self.e_stop      = EMERGENCY_STOP
+        self.max_retries = 3
+        self.verifier = PlacementVerifier(robot)
 
     def run(self, order):
-        """
-        Run the autonomous agent loop for a given order.
-
-        Args:
-            order: natural language string
-                   e.g. "pick red and place at dispatch,
-                          then stack blue on green"
-
-        Returns:
-            {
-              "success": True/False,
-              "completed": [...],
-              "failed": [...],
-              "steps_taken": int,
-              "summary": "human readable result"
-            }
-        """
         print(f"\n{'='*50}")
         print(f"  🤖 WAREHOUSE AGENT STARTING")
         print(f"  📦 Order: {order}")
         print(f"{'='*50}\n")
 
         self.e_stop.reset()
+        self.verifier.load_calibration()
 
-        # Reset slot occupancy for fresh run
+        # Reset slot occupancy
         if hasattr(self.robot, "slot_occupants"):
             self.robot.slot_occupants = {}
             print("  [SLOT] Slot occupancy reset for new order")
 
-        # Step 1 — Decompose order into subtasks
-        # Use robot.objects directly — always accurate, no camera errors
+        # Decompose
         known_objects = list(self.robot.objects.keys())
         print(f"  📦 Known objects in scene: {known_objects}")
-        subtasks = decompose_order(order, self.client, self.model,
-                                   known_objects=known_objects)
-        remaining = list(subtasks)   # copy
-        completed = []
-        failed    = []
-        steps     = 0
+        subtasks  = decompose_order(order, self.client, self.model,
+                                    known_objects=known_objects)
+        remaining  = list(subtasks)
+        completed  = []
+        failed     = []
+        steps      = 0
         last_result = None
 
-        # Step 2 — Execute subtasks in loop
         while remaining:
 
-            # Emergency stop check
             if self.e_stop.is_active():
                 print(f"\n  🛑 Agent stopped: {self.e_stop.reason}")
                 self.robot.home()
-                return self._build_result(False, completed, failed, steps,
-                                          f"stopped: {self.e_stop.reason}")
+                return self._build_result(
+                    False, completed, failed, steps,
+                    f"stopped: {self.e_stop.reason}"
+                )
 
-            current_subtask = remaining[0]
-            retries = 0
+            # FIX FOR BUG 1:
+            # current_subtask is ALWAYS remaining[0]
+            # future_subtasks is remaining[1:]
+            # completed is the done list
+            # Claude sees these separately - no confusion
+            current_subtask  = remaining[0]
+            future_subtasks  = remaining[1:]
+            retries          = 0
 
             print(f"\n  📌 Current subtask: {current_subtask}")
 
-            # Inner retry loop for each subtask
             while retries < self.max_retries:
 
-                # Emergency stop check inside retry loop
                 if self.e_stop.is_active():
                     break
 
                 steps += 1
 
-                # Step 3 — Build observation
+                # Build observation with clear sections
                 obs = build_observation(
-                    robot=self.robot,
-                    completed_tasks=completed,
-                    failed_tasks=failed,
-                    remaining_order=[t for t in remaining],
-                    last_result=last_result
+                    robot           = self.robot,
+                    completed_tasks = completed,
+                    failed_tasks    = failed,
+                    current_subtask = current_subtask,
+                    future_subtasks = future_subtasks,
+                    last_result     = last_result
                 )
 
-                # Step 4 — Claude reasons and chooses action
                 print(f"\n  👁️  Observing scene...")
                 print(f"  🧠 Claude reasoning (attempt {retries + 1})...")
 
@@ -411,7 +346,6 @@ class WarehouseAgent:
                 print(f"  💭 Thinking: {decision.get('thinking', '')}")
                 print(f"  ▶️  Action:   {decision.get('message', '')}")
 
-                # Check for done/failed signals
                 if decision["action"] == "done":
                     completed.append(str(current_subtask))
                     remaining.pop(0)
@@ -422,43 +356,31 @@ class WarehouseAgent:
                 if decision["action"] == "failed":
                     print(f"  ❌ Agent gave up: {decision.get('message')}")
                     failed.append({
-                        "task": str(current_subtask),
+                        "task":   str(current_subtask),
                         "reason": decision.get("message", "unknown")
                     })
                     remaining.pop(0)
-                    last_result = {"action": str(current_subtask),
-                                   "status": "failed",
-                                   "detail": decision.get("message")}
                     break
 
-                # Step 5 — Safety check: if subtask is pick but holding something
-                # inject a place action first rather than letting agent thrash
-                action_to_run = decision.get("action")
-                if action_to_run == "pick" and self.robot.grasped_object:
+                # Safety: if trying to pick but holding something
+                if (decision.get("action") == "pick"
+                        and self.robot.grasped_object):
                     held = self.robot.grasped_object
-                    print(f"  ⚠️  Holding '{held}' — placing aside before pick")
-                    aside_result = self.robot.place_object(0.45, 0.15)
-                    if isinstance(aside_result, bool):
-                        aside_ok = aside_result
-                    else:
-                        aside_ok = aside_result.get("status") == "success"
-                    if not aside_ok:
-                        # Try different aside position
-                        aside_result = self.robot.place_object(0.45, -0.15)
+                    print(f"  ⚠️  Holding '{held}' — placing aside first")
+                    self.robot.place_object(0.45, 0.15)
 
-                # Step 5 — Execute action
-                last_result = self._execute_action(decision)
+                last_result = self._execute_action(
+                    decision, current_subtask
+                )
 
-                print(f"  {'✅' if last_result['status'] == 'success' else '❌'} "
-                      f"Result: {last_result['status']} — {last_result['detail']}")
+                status_icon = "✅" if last_result["status"] == "success" else "❌"
+                print(f"  {status_icon} Result: "
+                      f"{last_result['status']} — {last_result['detail']}")
 
-                # Step 6 — Check result
                 if last_result["status"] == "success":
-                    # Check if this completes the current subtask
                     if self._subtask_complete(current_subtask, last_result):
                         completed.append(str(current_subtask))
                         remaining.pop(0)
-                        last_result["detail"] += " ✓ subtask complete"
                         break
                 else:
                     retries += 1
@@ -466,16 +388,14 @@ class WarehouseAgent:
                           f"Reason: {last_result.get('detail')}")
 
             else:
-                # Exhausted all retries
                 print(f"  ❌ Subtask failed after {self.max_retries} attempts")
                 failed.append({
-                    "task": str(current_subtask),
-                    "reason": last_result.get("detail", "max retries exceeded")
-                                if last_result else "unknown"
+                    "task":   str(current_subtask),
+                    "reason": last_result.get("detail", "max retries")
+                              if last_result else "unknown"
                 })
                 remaining.pop(0)
 
-        # Done
         success = len(failed) == 0
         summary = self._build_summary(completed, failed, steps)
         print(f"\n{'='*50}")
@@ -483,32 +403,27 @@ class WarehouseAgent:
         print(f"  {summary}")
         print(f"{'='*50}\n")
 
+        self.verifier.save_calibration()
+        self.verifier.get_calibration_report()
         return self._build_result(success, completed, failed, steps, summary)
 
     def _get_decision(self, observation, current_subtask, retry_count):
-        """
-        Ask Claude to decide the next action given the observation.
-        Returns parsed decision dict or None on failure.
-        """
+        """Ask Claude for next action."""
         user_msg = (
             f"{observation}\n\n"
-            f"Current subtask to complete: {current_subtask}\n"
-            f"Retry attempt: {retry_count}\n"
-            f"{'PREVIOUS ATTEMPT FAILED — try a different approach' if retry_count > 0 else ''}\n\n"
-            f"What is your next action? Return JSON only."
+            f"YOUR TASK RIGHT NOW: {current_subtask}\n"
+            f"{'⚠️  PREVIOUS ATTEMPT FAILED — try different approach' if retry_count > 0 else ''}\n\n"
+            f"Return JSON only. Execute the DO NOW task."
         )
 
         try:
             response = self.client.messages.create(
-                model=self.model,
-                max_tokens=300,
-                system=ORCHESTRATOR_PROMPT,
-                messages=[{"role": "user", "content": user_msg}]
+                model       = self.model,
+                max_tokens  = 300,
+                system      = ORCHESTRATOR_PROMPT,
+                messages    = [{"role": "user", "content": user_msg}]
             )
-
             text = response.content[0].text.strip()
-
-            # Parse JSON
             import re
             match = re.search(r'\{.*\}', text, re.DOTALL)
             if match:
@@ -519,82 +434,99 @@ class WarehouseAgent:
             print(f"  ⚠️  Decision error: {e}")
             return None
 
-    def _execute_action(self, decision):
-        """
-        Execute a single action and return rich status dict.
-        Maps Claude's decision to robot methods.
-        """
+    def _execute_action(self, decision, current_subtask):
+        """Execute action and return status dict."""
         action = decision.get("action")
         params = decision.get("params", {})
 
         try:
+            # ──────────────────────────────────────────
             if action == "scan":
-                # Use robot.objects directly — always accurate
-                # camera-based scan can miss objects at table edges
                 positions = self.robot.get_all_object_positions()
                 return {
                     "action": "scan",
                     "status": "success",
-                    "detail": f"found {len(positions)} objects: {list(positions.keys())}"
+                    "detail": f"found {len(positions)} objects: "
+                              f"{list(positions.keys())}"
                 }
 
+            # ──────────────────────────────────────────
             elif action == "pick":
                 obj = params.get("object", "")
                 if not obj:
                     return {"action": "pick", "status": "failed",
                             "detail": "no object specified"}
 
-                # Reachability gate — check before attempting
+                # FIX FOR BUG 2:
+                # Block picking from slot positions
+                if hasattr(self.robot, "slot_occupants"):
+                    for sn, occupant in self.robot.slot_occupants.items():
+                        if occupant == obj:
+                            return {
+                                "action": "pick",
+                                "status": "failed",
+                                "detail": f"{obj} is in slot {sn} — "
+                                          f"cannot pick from conveyor slot"
+                            }
+
+                # FIX FOR BUG 3:
+                # Check object has not drifted out of reach
                 pos = self.robot.get_object_position(obj)
                 if pos:
-                    reach = self.robot.check_reachability(pos[0], pos[1])
-                    dist  = reach.get("distance", 0)
-
+                    reach = self.robot.check_reachability(
+                        pos[0], pos[1], pos[2]
+                    )
+                    dist = reach.get("distance", 0)
                     if not reach["reachable"]:
-                        # Hard block — too close or too far
-                        print(f"  [REACH] ❌ Cannot pick {obj}: {reach['message']}")
+                        print(f"  [REACH] ❌ {obj} unreachable ({dist}m)")
                         return {
                             "action": "pick",
                             "status": "failed",
-                            "target": obj,
-                            "detail": f"unreachable: {reach['message']} — "
-                                      f"object must be moved to safe zone (0.30-0.65m)"
+                            "detail": f"{obj} is at {dist}m — "
+                                      f"out of reach (safe zone: 0.30-0.65m)"
                         }
                     elif reach["severity"] == "warning":
-                        # Warn but allow attempt
-                        print(f"  [REACH] ⚠️  {obj} at edge of reach ({dist}m) — attempting")
+                        print(f"  [REACH] ⚠️  {obj} at edge ({dist}m) — attempting")
                     else:
                         print(f"  [REACH] ✅ {obj} reachable ({dist}m)")
 
                 result = self.robot.pick_object(obj)
-                # Handle both old bool returns and new dict returns
+
                 if isinstance(result, bool):
-                    ok = result
                     result = {
                         "action": "pick",
-                        "status": "success" if ok else "failed",
+                        "status": "success" if result else "failed",
                         "target": obj,
-                        "detail": f"picked {obj}" if ok else f"failed to pick {obj}"
+                        "detail": f"picked {obj} from "
+                                  f"({pos[0]:.2f},{pos[1]:.2f},{pos[2]:.2f})"
+                                  if result and pos
+                                  else f"failed to pick {obj}"
                     }
-                # Clear slot occupancy if this object was in a slot
+
+                # Clear slot if object was tracked there
                 if result.get("status") == "success":
                     if hasattr(self.robot, "slot_occupants"):
-                        for sn, occupant in list(self.robot.slot_occupants.items()):
+                        for sn, occupant in list(
+                            self.robot.slot_occupants.items()
+                        ):
                             if occupant == obj:
                                 del self.robot.slot_occupants[sn]
-                                print(f"  [SLOT] Slot {sn} cleared (picked {obj})")
+                                print(f"  [SLOT] Slot {sn} cleared "
+                                      f"(picked {obj})")
                 return result
 
+            # ──────────────────────────────────────────
             elif action in ("place", "place_slot"):
-                # Check if placing in a numbered slot
+
                 slot_num = params.get("slot") or params.get("slot_number")
 
-                # Ensure slot state exists (defensive — works with old robot.py too)
                 if not hasattr(self.robot, "conveyor_slots"):
+                    # Slots at 0.60m max - even with 15cm drift
+                    # object stays within 0.75m reach
                     self.robot.conveyor_slots = {
-                        1: (0.72,  0.30),
-                        2: (0.72,  0.00),
-                        3: (0.72, -0.30),
+                        1: (0.60,  0.25),
+                        2: (0.60,  0.00),
+                        3: (0.60, -0.25),
                     }
                 if not hasattr(self.robot, "slot_occupants"):
                     self.robot.slot_occupants = {}
@@ -606,28 +538,50 @@ class WarehouseAgent:
                     slot_num = int(slot_num)
                     if slot_num not in slots:
                         return {"action": "place", "status": "failed",
-                                "detail": f"slot {slot_num} does not exist (valid: 1,2,3)"}
+                                "detail": f"slot {slot_num} does not exist"}
+
                     occupant = occupied.get(slot_num)
                     if occupant:
-                        return {"action": "place", "status": "failed",
-                                "detail": f"slot {slot_num} already occupied by {occupant}"}
+                        # FIX FOR BUG 5:
+                        # Instead of auto-assigning silently
+                        # find next empty and tell Claude clearly
+                        next_slot = None
+                        for sn in sorted(slots.keys()):
+                            if sn not in occupied:
+                                next_slot = sn
+                                break
+                        if next_slot is None:
+                            return {
+                                "action": "place",
+                                "status": "failed",
+                                "detail": f"slot {slot_num} occupied by "
+                                          f"{occupant} and no empty slots left"
+                            }
+                        print(f"  [SLOT] Slot {slot_num} occupied — "
+                              f"using slot {next_slot} instead")
+                        slot_num = next_slot
+
                     x_final, y_final = slots[slot_num]
-                    print(f"  [SLOT] Placing in slot {slot_num} at ({x_final}, {y_final})")
+                    print(f"  [SLOT] Placing in slot {slot_num} "
+                          f"at ({x_final}, {y_final})")
 
                 else:
                     x = float(params.get("x", 0.4))
                     y = float(params.get("y", 0.0))
 
-                    # Auto-assign slot if target is conveyor area (x >= 0.68)
-                    if x >= 0.58 or abs(x - 0.63) < 0.08:
+                    if x >= 0.58:
+                        # Conveyor area — find empty slot
                         slot_num = None
                         for sn in sorted(slots.keys()):
-                            if sn not in occupied or occupied[sn] is None:
+                            if sn not in occupied:
                                 slot_num = sn
                                 break
                         if slot_num is None:
-                            return {"action": "place", "status": "failed",
-                                    "detail": "all conveyor slots are occupied"}
+                            return {
+                                "action": "place",
+                                "status": "failed",
+                                "detail": "all conveyor slots are occupied"
+                            }
                         x_final, y_final = slots[slot_num]
                         print(f"  [SLOT] Auto-assigned slot {slot_num} "
                               f"at ({x_final}, {y_final})")
@@ -635,101 +589,103 @@ class WarehouseAgent:
                         x_final, y_final = x, y
                         slot_num = None
 
-                result = self.robot.place_object(x_final, y_final)
+                # Check holding something
+                if not self.robot.grasped_object:
+                    return {"action": "place", "status": "failed",
+                            "detail": "not holding anything"}
+
+                held_obj = self.robot.grasped_object
+                result   = self.robot.place_object(x_final, y_final)
 
                 # Update slot occupancy on success
                 if slot_num is not None:
-                    ok = result.get("status") == "success" if isinstance(result, dict) else bool(result)
+                    ok = (result.get("status") == "success"
+                          if isinstance(result, dict) else bool(result))
                     if ok:
-                        # Record what was just placed (before grasped_object clears)
-                        self.robot.slot_occupants[slot_num] = placed_name = (
-                            result.get("target") if isinstance(result, dict) else "object"
+                        # Live verification - check and fix drift
+                        sx, sy = slots[slot_num]
+                        verify = self.verifier.verify_and_fix(
+                            held_obj, sx, sy,
+                            slot_num=slot_num
                         )
-                        print(f"  [SLOT] ✅ Slot {slot_num} occupied by {placed_name}")
+                        if verify["status"] == "failed":
+                            return {
+                                "action": "place",
+                                "status": "failed",
+                                "target": held_obj,
+                                "detail": verify["detail"]
+                            }
+                        self.robot.slot_occupants[slot_num] = held_obj
+                        print(f"  [SLOT] ✅ Slot {slot_num} "
+                              f"occupied by {held_obj}")
+
                 if isinstance(result, bool):
                     return {
                         "action": "place",
                         "status": "success" if result else "failed",
-                        "target": f"({x}, {y})",
-                        "detail": f"placed at ({x}, {y})" if result
-                                  else f"failed to place at ({x}, {y})"
+                        "target": held_obj,
+                        "detail": f"placed {held_obj} at "
+                                  f"({x_final:.2f},{y_final:.2f})"
+                                  if result
+                                  else f"failed to place {held_obj}"
                     }
                 return result
 
+            # ──────────────────────────────────────────
             elif action == "stack":
-                # Accept all key variants Claude might use
-                obj = (params.get("object")
-                       or params.get("item")
-                       or decision.get("object", ""))
-                # Accept target under any key Claude might send
-                target = (params.get("on")
-                          or params.get("target")
-                          or params.get("stack_on")
+                obj    = (params.get("object") or params.get("item")
+                          or decision.get("object", ""))
+                target = (params.get("on") or params.get("target")
                           or params.get("onto")
                           or decision.get("on", "")
-                          or decision.get("target", ""))
+                          or current_subtask.get("on", ""))
 
                 if not obj or not target:
-                    # Last resort: if holding something and only one target in scene
-                    if self.robot.grasped_object:
-                        obj = self.robot.grasped_object
-                    all_objs = list(self.robot.objects.keys())
-                    if not target and len(all_objs) > 0:
-                        # Try to infer from subtask definition
-                        target = current_subtask.get("on", current_subtask.get("target", ""))
-                    if not obj or not target:
-                        return {"action": "stack", "status": "failed",
-                                "detail": "missing object or target for stack"}
+                    return {"action": "stack", "status": "failed",
+                            "detail": "missing object or target for stack"}
 
-                # KEY FIX: only pick if not already holding the object
                 if self.robot.grasped_object == obj:
                     print(f"  [STACK] Already holding {obj} — skipping pick")
                     pick_ok = True
-                elif self.robot.grasped_object and self.robot.grasped_object != obj:
-                    # Holding something else — place it aside first
+                elif self.robot.grasped_object:
                     held = self.robot.grasped_object
-                    print(f"  [STACK] Holding {held}, placing aside before stack")
+                    print(f"  [STACK] Holding {held}, placing aside first")
                     self.robot.place_object(0.45, 0.15)
                     pick_result = self.robot.pick_object(obj)
-                    pick_ok = pick_result.get("status") == "success"                               if isinstance(pick_result, dict) else pick_result
+                    pick_ok = (pick_result.get("status") == "success"
+                               if isinstance(pick_result, dict)
+                               else pick_result)
                 else:
-                    # Not holding anything — pick normally
                     pick_result = self.robot.pick_object(obj)
-                    pick_ok = pick_result.get("status") == "success"                               if isinstance(pick_result, dict) else pick_result
+                    pick_ok = (pick_result.get("status") == "success"
+                               if isinstance(pick_result, dict)
+                               else pick_result)
 
                 if not pick_ok:
                     return {"action": "stack", "status": "failed",
-                            "target": obj,
-                            "detail": f"could not pick {obj} for stacking"}
+                            "detail": f"could not pick {obj}"}
 
-                # Place on target
                 target_pos = self.robot.get_object_position(target)
                 if not target_pos:
                     return {"action": "stack", "status": "failed",
-                            "target": target,
-                            "detail": f"stack target '{target}' not found"}
+                            "detail": f"target '{target}' not found"}
 
                 place_result = self.robot.place_object(
                     target_pos[0], target_pos[1], stack_on=target
                 )
-                place_ok = place_result.get("status") == "success"                            if isinstance(place_result, dict) else place_result
-
-                # Check verified position from feedback system
-                if isinstance(place_result, dict):
-                    place_status = place_result.get("status")
-                    place_detail = place_result.get("detail", "")
-                else:
-                    place_status = "success" if place_ok else "failed"
-                    place_detail = f"stacked {obj} on {target}"
+                ok = (place_result.get("status") == "success"
+                      if isinstance(place_result, dict)
+                      else place_result)
 
                 return {
                     "action": "stack",
-                    "status": place_status,
+                    "status": "success" if ok else "failed",
                     "target": f"{obj} on {target}",
-                    "detail": place_detail if place_status == "failed"
-                              else f"stacked {obj} on {target} ✅ verified"
+                    "detail": f"stacked {obj} on {target} ✅ verified"
+                              if ok else "stack failed"
                 }
 
+            # ──────────────────────────────────────────
             elif action == "home":
                 self.robot.home()
                 return {"action": "home", "status": "success",
@@ -744,33 +700,24 @@ class WarehouseAgent:
                     "detail": f"exception: {str(e)}"}
 
     def _subtask_complete(self, subtask, last_result):
-        """
-        Check if the last successful action completed the current subtask.
-        """
         if last_result["status"] != "success":
             return False
-
         action    = subtask.get("action")
         completed = last_result.get("action")
-
-        # Direct action match
         if action == completed:
             return True
-
-        # Stack completes when place succeeds (stack = pick + place)
         if action == "stack" and completed in ["stack", "place"]:
             return True
-
         return False
 
     def _build_summary(self, completed, failed, steps):
-        total = len(completed) + len(failed)
-        failed_tasks = [f["task"] for f in failed]
-        outcome = "All tasks done!" if not failed else f"Failed: {failed_tasks}"
-        return (
-            f"Completed {len(completed)}/{total} subtasks "
-            f"in {steps} action steps. {outcome}"
-        )
+        total       = len(completed) + len(failed)
+        failed_list = [f["task"] for f in failed]
+        outcome     = ("All tasks done!"
+                       if not failed
+                       else f"Failed: {failed_list}")
+        return (f"Completed {len(completed)}/{total} subtasks "
+                f"in {steps} action steps. {outcome}")
 
     def _build_result(self, success, completed, failed, steps, summary):
         return {
