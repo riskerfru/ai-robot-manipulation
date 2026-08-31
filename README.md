@@ -1,6 +1,48 @@
 # AI Robot Manipulation — Franka Panda + Claude AI
 
-A simulation of an AI-powered robot manipulation system built with PyBullet, featuring a Claude-driven autonomous warehouse agent, physics-driven grasping, visual servoing, RRT* motion planning, TOPP-RA trajectory generation, live placement verification, and a wrist camera system.
+PyBullet warehouse cell: a cell operator types a natural-language order; a Claude agent picks and places blocks onto a three-slot conveyor, then a verifier checks the landing.
+
+This folder is the micro1 **Agentic Workflows** entry.
+
+## 1. Who has this problem?
+
+A **cell operator** on a small packing line. They should say “dispatch the blocks,” not jog joints.
+
+## 2. What bottleneck makes it worth solving?
+
+A scripted `pick` / `place` looks finished in the GUI and still drops a block 10+ cm off the slot, or picks a block already on the conveyor. That miss is a jammed line. Re-picking by hand is the job.
+
+## 3. Does the agent solve it well?
+
+Yes, on the scored cases and on the recorded order.
+
+| Metric | Simple baseline | Agent solution | Change |
+|---|---|---|---|
+| Primary — honest placement (12 cases) | 0.83 (10/12) | 1.00 (12/12) | **+0.17** |
+| Recorded dispatch | n/a (manual picks) | **6/6 subtasks in 9 steps** | order completes |
+| Human time per task | watch + re-pick | unattended after the order | operator idle |
+| Cost per scored eval | $0 | $0 | $0 |
+
+Baseline = typed pick/place, no verifier (the manual process today).
+Agent = Observe→Think→Act→Verify + 8 cm retry + slot calibration.
+
+Hard case `unreachable`: block at (0.95, 0.95), 78 cm off slot. Baseline still counts it placed. Agent reports fail after rescue. That is the jam the verifier is for.
+
+## 4. Can another person reproduce the result?
+
+Yes. Clean machine, no API key:
+
+```bash
+python -m pip install -r requirements.txt
+python -m pytest -q
+python eval.py
+```
+
+Expect 10 tests passed and the table above. Full walk-through: [REPRODUCTION.md](REPRODUCTION.md). Changelog: [CHANGELOG.md](CHANGELOG.md). Trajectories: [trajectories/](trajectories/). Agent prompt: [agents/ORCHESTRATOR.md](agents/ORCHESTRATOR.md). Video: https://youtu.be/cJXKncODGrU
+
+**Before this sprint:** PyBullet Panda, RRT*, typed commands, Claude stubs.
+**Added this sprint:** verifier, calibration, DO NOW observation, this packet.
+`hardware/` is empty stubs. Simulation only. Never commit `.env`.
 
 ---
 
@@ -13,18 +55,18 @@ A simulation of an AI-powered robot manipulation system built with PyBullet, fea
 ```
 Command: auto dispatch all blocks to the conveyor
 
-  🤖 WAREHOUSE AGENT STARTING
-  📦 Order: dispatch all blocks to the conveyor
+  WAREHOUSE AGENT STARTING
+  Order: dispatch all blocks to the conveyor
 
   [GRIPPER] Open (4cm)
   [DESCENT] From z=0.526m seeking contact...
   [DESCENT] Contact at z=0.162m torque=9.3
   [GRIPPER] Contact at gap=0.018m — gripping
-  [GRASP] ✅ Object lifted to z=0.220m
+  [GRASP] Object lifted to z=0.220m
 
-  ✅ pick red  →  place slot 1  ✅
-  ✅ pick blue →  place slot 2  ✅
-  ✅ pick green → place slot 3  ✅
+  pick red  →  place slot 1  Success
+  pick blue →  place slot 2  Success
+  pick green → place slot 3  Success
 
   ORDER COMPLETE — 6/6 subtasks in 9 action steps
 ```
