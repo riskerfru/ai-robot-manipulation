@@ -117,6 +117,7 @@ class Hud:
         self.truth = None                # [(part, drift_cm, ok)]
         self.sim_time = 0.0
         self.measured = True
+        self.free_text = False           # order typed, not a PLC job
 
     def event(self, text, colour=TEXT):
         self.events.append((self.sim_time, text, colour))
@@ -132,6 +133,9 @@ class Hud:
         elif name == "order_received":
             if not d.get("recipe"):
                 self.order_source = "Operator, free text"
+                self.free_text = True
+                self.cell_state = "BUSY"
+                self.truth = None
             self.order_text = d.get("order", self.order_text)
         elif name == "order_decomposed":
             self.tasks = [[describe(s), "pending"] for s in d["subtasks"]]
@@ -185,6 +189,10 @@ class Hud:
                            AMBER)
         elif name == "cell_state":
             self.cell_state = d["state"]
+        elif name == "order_result" and self.free_text:
+            self.cell_state = "DONE" if d.get("success") else "FAULT"
+            self.event("Order complete" if d.get("success")
+                       else "Order FAILED", GREEN if d.get("success") else RED)
         elif name == "degraded_mode":
             self.event("Language model unavailable: recipe mode", AMBER)
 
@@ -216,11 +224,8 @@ class Hud:
         y += 30
 
         label("Tasks")
-        marks = {"done": ("✓", GREEN), "current": ("▶", BLUE),
-                 "pending": ("○", MUTED), "failed": ("✕", RED)}
         for text, status in self.tasks[:7] or [["-", "pending"]]:
-            mark, colour = marks[status]
-            d.text((x0, y), mark, font=F_MONO, fill=colour)
+            self._mark(d, x0, y, status)
             d.text((x0 + 24, y - 2), text,
                    font=F_BOLD if status == "current" else F_BODY,
                    fill=TEXT if status != "pending" else MUTED)
@@ -245,8 +250,7 @@ class Hud:
         if self.truth is not None:
             label("True position (simulator)")
             for part, drift, ok in self.truth:
-                d.text((x0, y), "✓" if ok else "✕", font=F_MONO,
-                       fill=GREEN if ok else RED)
+                self._mark(d, x0, y, "done" if ok else "failed")
                 d.text((x0 + 24, y - 2),
                        f"{part}: {drift:.1f} cm from slot centre",
                        font=F_BODY, fill=TEXT if ok else RED)
@@ -262,6 +266,22 @@ class Hud:
         d.text((16, H - 30), f"Simulation  ·  {SPEED:.0f}x speed  ·  "
                f"t = {self.sim_time:5.1f} s", font=F_SMALL, fill=(70, 76, 86))
         return img
+
+    @staticmethod
+    def _mark(d, x, y, status):
+        """Status marks drawn as shapes, so no font has to supply them."""
+        cx, cy = x + 7, y + 8
+        if status == "done":
+            d.line([(cx - 5, cy), (cx - 1, cy + 4), (cx + 6, cy - 5)],
+                   fill=GREEN, width=2)
+        elif status == "current":
+            d.polygon([(cx - 4, cy - 6), (cx + 6, cy), (cx - 4, cy + 6)],
+                      fill=BLUE)
+        elif status == "failed":
+            d.line([(cx - 5, cy - 5), (cx + 5, cy + 5)], fill=RED, width=2)
+            d.line([(cx - 5, cy + 5), (cx + 5, cy - 5)], fill=RED, width=2)
+        else:
+            d.ellipse([cx - 5, cy - 5, cx + 5, cy + 5], outline=MUTED, width=1)
 
     @staticmethod
     def _pill(d, x, y, text, colour):
@@ -383,6 +403,18 @@ def show_truth(cell, hud, recipe=1):
     for pick, place in zip(steps[0::2], steps[1::2]):
         part = pick["object"]
         sx, sy = cell.robot.conveyor_slots[place["slot"]]
+        pos = cell.robot.get_object_position(part)
+        drift = 100 * math.hypot(pos[0] - sx, pos[1] - sy)
+        truth.append((part, drift,
+                      drift <= 100 * cfg.PLACEMENT["tolerance_m"]))
+    hud.truth = truth
+
+
+def show_truth_from_slots(cell, hud):
+    """As show_truth, for an order whose steps the model chose."""
+    truth = []
+    for slot, part in sorted(cell.robot.slot_occupants.items()):
+        sx, sy = cell.robot.conveyor_slots[slot]
         pos = cell.robot.get_object_position(part)
         drift = 100 * math.hypot(pos[0] - sx, pos[1] - sy)
         truth.append((part, drift,
@@ -555,7 +587,8 @@ def scenario_order(rec, text):
     announce_retries(cell, hud)
     rec.hold(1.5)
     quiet(cell.agent.run, text)
-    rec.hold(4.0)
+    show_truth_from_slots(cell, hud)
+    rec.hold(5.0)
     cell.soft_plc.stop()
 
 

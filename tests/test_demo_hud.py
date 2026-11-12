@@ -42,3 +42,23 @@ def test_frame_has_the_expected_size():
     hud = Hud("t", "s", "f")
     frame = hud.draw(Image.new("RGB", (SCENE_W, H)))
     assert frame.size == (W, H)
+
+
+def test_free_text_order_drives_the_cell_state():
+    hud = Hud("t", "s", "f")
+    hud.on_audit("order_received", {"order": "dispatch all", "recipe": False})
+    assert hud.cell_state == "BUSY"
+    hud.on_audit("order_result", {"success": True})
+    assert hud.cell_state == "DONE"
+
+
+def test_marks_do_not_depend_on_font_glyphs():
+    hud = Hud("t", "s", "f")
+    hud.tasks = [["a", "done"], ["b", "current"], ["c", "pending"],
+                 ["d", "failed"]]
+    hud.truth = [("red", 0.5, True), ("blue", 9.2, False)]
+    frame = hud.draw(Image.new("RGB", (SCENE_W, H)))
+    colours = {frame.getpixel((x, y)) for x in range(SCENE_W + 24, SCENE_W + 40)
+               for y in range(190, 300)}
+    from record_demo import BLUE, GREEN, RED
+    assert {GREEN, BLUE, RED} <= colours

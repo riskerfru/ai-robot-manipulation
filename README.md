@@ -79,7 +79,7 @@ git clone https://github.com/riskerfru/ai-robot-manipulation.git
 cd ai-robot-manipulation
 pip install -r requirements.txt
 
-python -m pytest -q                     # 77 tests, about 20 s
+python -m pytest -q                     # 79 tests, about 20 s
 python run_cell.py                      # two PLC jobs, headless, no API key
 python run_cell.py --scenario guard     # guard door opens mid-job
 python run_cell.py --gui                # watch it
