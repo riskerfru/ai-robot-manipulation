@@ -37,7 +37,7 @@ CUSTOM_URDF_PATH = ""  # e.g. "C:/robots/my_robot.urdf"
 SIM_GRAVITY         = -9.81
 SIM_TIMESTEP        = 1 / 240
 SIM_STEPS_PER_MOVE  = 150
-SIM_GUI             = True       # False = headless (no window)
+SIM_GUI             = os.getenv("SIM_GUI", "1") != "0"   # SIM_GUI=0 = headless
 
 # --------------------------------------------------------------
 # ROBOT PHYSICAL LIMITS
@@ -130,6 +130,15 @@ SAFETY = {
 }
 
 # --------------------------------------------------------------
+# PLACEMENT TOLERANCE (from the part drawing / process sheet)
+# --------------------------------------------------------------
+PLACEMENT = {
+    "tolerance_m": 0.02,   # out of tolerance above this: retry, then fail
+    "warn_m": 0.012,       # accepted, but flagged in the audit trail
+    "max_retries": 2
+}
+
+# --------------------------------------------------------------
 # CAMERA SETTINGS
 # --------------------------------------------------------------
 CAMERA = {
@@ -149,7 +158,8 @@ AI = {
     "model": "claude-opus-4-5",
     "max_tokens": 500,
     "memory_length": 10,           # How many past commands to remember
-    "temperature": 0.1             # Low = more deterministic robot commands
+    "temperature": 0.1,            # Low = more deterministic robot commands
+    "timeout_s": 20.0              # Give up on a model call after this long
 }
 
 # --------------------------------------------------------------

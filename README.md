@@ -1,382 +1,188 @@
-# AI Robot Manipulation — Franka Panda + Claude AI
+# Language-model robot cell with a deterministic safety layer
 
-PyBullet warehouse cell: a cell operator types a natural-language order; a Claude agent picks and places blocks onto a three-slot conveyor, then a verifier checks the landing.
+A pick-and-place cell in PyBullet (Franka Panda) that takes an order in plain
+language, plans collision-free motion with RRT* and TOPP-RA, places parts on
+a three-slot conveyor, and measures every placement before reporting it.
 
-This folder is the micro1 **Agentic Workflows** entry.
+Around the language model sits the structure a production cell needs: a
+deterministic safety gate, a PLC handshake, pre-approved recipes that run
+without the model, and a tamper-evident audit trail.
 
-## 1. Who has this problem?
+**Status: validated in simulation. Not run on a real robot, not certified.**
+See [docs/INDUSTRIAL_INTEGRATION.md](docs/INDUSTRIAL_INTEGRATION.md) for
+exactly what is and is not done.
 
-A **cell operator** on a small packing line. They should say “dispatch the blocks,” not jog joints.
+Demo video: https://youtu.be/cJXKncODGrU
 
-## 2. What bottleneck makes it worth solving?
+## The idea
 
-A scripted `pick` / `place` looks finished in the GUI and still drops a block 10+ cm off the slot, or picks a block already on the conveyor. That miss is a jammed line. Re-picking by hand is the job.
+A language model is good at turning "dispatch the blocks" into steps. It is
+not something you let command a robot directly. So:
 
-## 3. Does the agent solve it well?
-
-Yes, on the scored cases and on the recorded order.
-
-| Metric | Simple baseline | Agent solution | Change |
-|---|---|---|---|
-| Primary — honest placement (12 cases) | 0.83 (10/12) | 1.00 (12/12) | **+0.17** |
-| Recorded dispatch | n/a (manual picks) | **6/6 subtasks in 9 steps** | order completes |
-| Human time per task | watch + re-pick | unattended after the order | operator idle |
-| Cost per scored eval | $0 | $0 | $0 |
-
-Baseline = typed pick/place, no verifier (the manual process today).
-Agent = Observe→Think→Act→Verify + 8 cm retry + slot calibration.
-
-Hard case `unreachable`: block at (0.95, 0.95), 78 cm off slot. Baseline still counts it placed. Agent reports fail after rescue. That is the jam the verifier is for.
-
-## 4. Can another person reproduce the result?
-
-Yes. Clean machine, no API key:
-
-```bash
-python -m pip install -r requirements.txt
-python -m pytest -q
-python eval.py
-```
-
-Expect 10 tests passed and the table above. Full walk-through: [REPRODUCTION.md](REPRODUCTION.md). Changelog: [CHANGELOG.md](CHANGELOG.md). Trajectories: [trajectories/](trajectories/). Agent prompt: [agents/ORCHESTRATOR.md](agents/ORCHESTRATOR.md). Video: https://youtu.be/cJXKncODGrU
-
-**Before this sprint:** PyBullet Panda, RRT*, typed commands, Claude stubs.
-**Added this sprint:** verifier, calibration, DO NOW observation, this packet.
-`hardware/` is empty stubs. Simulation only. Never commit `.env`.
-
----
-
-## Demo
-
-[![AI Robot Demo](https://img.youtube.com/vi/woKWzid6joI/0.jpg)](https://youtu.be/cJXKncODGrU)
-
-*Autonomous warehouse agent completing a full dispatch order — 6/6 subtasks in under 10 action steps*
+- The model **reads** the cell through 11 tools and **requests** one of six
+  actions. It never produces a trajectory, a joint target or a speed.
+- Deterministic code decides whether the request is carried out: slot
+  occupancy, reachability, workspace limits, cell interlocks.
+- Classical planning (RRT*, TOPP-RA, visual servoing) produces the motion.
+- A verifier measures where the part landed. In tolerance, or reported as a
+  failure. Never assumed.
+- The cell PLC stays in charge. If the model is unavailable, the cell runs
+  recipes and says so.
 
 ```
-Command: auto dispatch all blocks to the conveyor
+ Operator (free text)        Cell PLC (master)
+        |                          |
+   Language model            Cell controller        READY / JOB_START / DONE / FAULT
+   11 read-only tools              |
+   6 actions                       | recipe steps
+        +-----------+--------------+
+                    v
+             Agent executor         one task at a time, slot and reach checks
+                    v
+            Safety supervisor       interlocks, workspace, keep-out, speed; fail-closed
+                    v
+             Robot interface        PyBullet Panda | UR5e over RTDE (untested on hardware)
+                    v
+           Placement verifier       measure, retry, calibrate, or report failure
 
-  WAREHOUSE AGENT STARTING
-  Order: dispatch all blocks to the conveyor
-
-  [GRIPPER] Open (4cm)
-  [DESCENT] From z=0.526m seeking contact...
-  [DESCENT] Contact at z=0.162m torque=9.3
-  [GRIPPER] Contact at gap=0.018m — gripping
-  [GRASP] Object lifted to z=0.220m
-
-  pick red  →  place slot 1  Success
-  pick blue →  place slot 2  Success
-  pick green → place slot 3  Success
-
-  ORDER COMPLETE — 6/6 subtasks in 9 action steps
+             Audit trail            every decision and refusal, hash-chained
 ```
 
----
+## Results
 
-## Architecture
+Simulation only: 720 placements in physics, 2 cm tolerance, no language
+model in the loop (orders run as recipes).
 
-This project mirrors the KinetIQ layered agent architecture:
+| Condition | No measurement | Measure, retry, calibrate |
+|---|---|---|
+| No disturbance | 93 % good, 7 % defects reported as placed | 100 % good, none escaped |
+| 30 % of parts knocked 3 to 15 cm | 70 % good, 30 % escaped | 90 % good, none escaped, the rest reported as failures |
+| 6 cm calibration error | 0 % good, 100 % escaped | 95 % good, none escaped |
 
-```
-┌─────────────────────────────────────────────┐
-│  System 3 — Natural Language Order          │
-│  "dispatch all blocks to the conveyor"       │
-└───────────────────┬─────────────────────────┘
-                    │
-┌───────────────────▼─────────────────────────┐
-│  System 2 — Claude AI Reasoning             │
-│  agent_loop.py · WarehouseAgent             │
-│  · Decomposes order into subtasks           │
-│  · Observe → Think → Act → Verify loop     │
-│  · Handles failures and replanning          │
-│  · Live placement verification              │
-│  · Self-calibrating slot offsets            │
-└───────────────────┬─────────────────────────┘
-                    │
-┌───────────────────▼─────────────────────────┐
-│  System 1 — Robot Capabilities              │
-│  core/robot.py                              │
-│  · pick(object)    · place(x, y)            │
-│  · place_slot(n)   · stack(obj, on)         │
-│  · scan()          · home()                 │
-└───────────────────┬─────────────────────────┘
-                    │
-┌───────────────────▼─────────────────────────┐
-│  System 0 — PyBullet Physics                │
-│  Franka Panda URDF · Rigid body dynamics    │
-│  Force/torque sensing · Contact detection   │
-└─────────────────────────────────────────────┘
-```
+Across 540 measured placements, no out-of-tolerance part was reported as
+placed and no good part was rejected. 60 parts per cell, so "none" means
+below about 6 % at 95 % confidence.
 
----
+Full tables and method: [EVAL.md](EVAL.md).
 
-## Features
+## What went wrong while building it
 
-### Physics-Driven Grasping (New)
-- **Force contact detection** — arm descends until joint torque spikes, no hardcoded heights
-- **Force-controlled finger closing** — fingers stop when resistance felt from object
-- **Grasp verification** — lifts slightly after grip, confirms object rose with arm
-- **Gradual constraint release** — force reduces 40→20→5→0N before release, prevents drift
-- Realistic open/close animation — fingers visibly spread (4cm) and close around object
+Six ways the language-model agent failed, and the fixes:
+[FAILURE_MODES.md](FAILURE_MODES.md). None was a planning or control
+failure. Each was the model losing track of the cell: which task it was on,
+which parts were where, what it could reach.
 
-### Wrist Camera System (New)
-- Camera attached to gripper end effector, follows arm everywhere
-- Captures gripper-eye view during pick and place operations
-- Saves frames to `wrist_frames/` during descent
-- `wrist_viewer.py` — live popup window showing gripper camera feed
-
-### GUI Camera Controls (New)
-- 7 camera toggle buttons in PyBullet window
-- Overhead, Front, Top, Side, Close-up, Wrist, Wide presets
-- Click any button to switch view instantly during operation
-
-### Live Placement Verification (New)
-- After every place, checks where object actually landed
-- If drift > 8cm and reachable: picks up and retries with calibration correction
-- If drift > 8cm and unreachable: attempts joint reconfiguration rescue
-- Reports honest failure if truly unreachable
-
-### Self-Calibrating Slot Offsets (New)
-- Records drift after every placement per slot
-- Calculates running average offset (last 5 placements)
-- Saves to `slot_calibration.json` — persists across sessions
-- Applies correction automatically next run
-- Gets more accurate with each order
-
-### Autonomous Agent Loop
-- Natural language order decomposition via Claude API
-- Clear observation format: DONE / DO NOW / NOT YET
-- Slot protection — cannot pick from occupied conveyor slots
-- Automatic retry with replanning on failure (3 attempts per subtask)
-- Known object list passed to decomposer — prevents hallucination
-
-### Motion Planning
-- RRT* with 6 strategies (direct, arc-left, arc-right, high, elbow-up, reconfigure)
-- TOPP-RA trajectory generation for smooth, time-optimal motion
-- Collision-aware transport path planning with clearance buffer
-
-### Visual Servoing
-- Overhead camera with colour blob detection
-- Oscillation prevention: skips servo if initial offset > 25px
-- Damped corrections (0.3×) with 8mm per-step limit
-
-### Reachability System
-- Live reachability check before every pick
-- PyBullet debug visualisation: ±110° working arc, green/orange/grey zones
-- Per-object status icons: ✅ ok / ⚠️ edge / ❌ unreachable
-
----
-
-## Observation Format
-
-Each agent reasoning step receives a structured observation:
-
-```
-=== ROBOT STATE ===
-Holding: nothing
-Robot at: (0.39, 0.00, 0.55)
-
-=== CONVEYOR SLOTS (NEVER PICK FROM THESE) ===
-  Slot 1: (0.60, +0.25) — EMPTY ← can place here
-  Slot 2: (0.60,  0.00) — occupied by blue
-  Slot 3: (0.60, -0.25) — EMPTY ← can place here
-
-=== OBJECTS ON TABLE (SAFE TO PICK) ===
-  ✅ red:   pos=(0.40, 0.00) dist=0.4m reach=ok
-  ✅ green: pos=(0.40,-0.30) dist=0.5m reach=ok
-
-=== OBJECTS IN SLOTS (DO NOT PICK) ===
-  🚫 blue: IN SLOT 2 — DO NOT PICK THIS
-
-╔══════════════════════════════════════╗
-║ TASKS ALREADY DONE (do not repeat): ║
-║ [pick red, place slot 1, pick blue] ║
-╠══════════════════════════════════════╣
-║ DO NOW (execute only this):          ║
-║ {'action': 'place_slot', 'slot': 2} ║
-╠══════════════════════════════════════╣
-║ NOT YET (do not do these yet):       ║
-║ [pick green, place slot 3]           ║
-╚══════════════════════════════════════╝
-```
-
----
-
-## Installation
+## Quick start
 
 ```bash
 git clone https://github.com/riskerfru/ai-robot-manipulation.git
 cd ai-robot-manipulation
-pip install pybullet anthropic numpy flask toppra pillow
+pip install -r requirements.txt
+
+python -m pytest -q                     # 74 tests, about 20 s
+python run_cell.py                      # two PLC jobs, headless, no API key
+python run_cell.py --scenario guard     # guard door opens mid-job
+python run_cell.py --gui                # watch it
+python eval_physics.py --orders 20      # the numbers above (about 35 min)
 ```
 
-Create a `.env` file:
-```
-ANTHROPIC_API_KEY=your_key_here
-```
-
----
-
-## Usage
+Free-text orders need an Anthropic API key in `.env`
+(`ANTHROPIC_API_KEY=...`, never commit it):
 
 ```bash
 python main.py
 ```
 
-### Autonomous agent mode
-
 ```
 auto dispatch all blocks to the conveyor
 auto pick red and place in slot 2
 auto stack blue on green, then move stack to slot 1
-auto place all the block in the slots of conveyer and then stop
+stop            emergency stop (latches)
+resume          operator reset
 ```
 
-### Direct commands
+More: [REPRODUCTION.md](REPRODUCTION.md).
+
+## What `run_cell.py --scenario guard` shows
 
 ```
-pick up red block
-move to position 0.4 0.0 0.5
-stack all blocks
-check reach 0.6 0.3
-status
-scan
-home
+  cell started            state=READY safety=RUN             parts_ok=0 slots=000 fault=0
+  PLC: JOB_START job=1001 recipe=1
+  job 1001 finished       state=FAULT safety=PROTECTIVE_STOP parts_ok=1 slots=001 fault=10 SAFETY_STOP
+  PLC: FAULT_RESET while the cause is still present
+  reset attempt 1         state=FAULT safety=PROTECTIVE_STOP
+  Operator clears the cause, then FAULT_RESET
+  reset attempt 2         state=READY safety=RUN
+  PLC: JOB_START job=1002 recipe=1
+  job 1002 finished       state=DONE  safety=RUN             parts_ok=3 slots=111 fault=0
+  Audit trail: 63 records, chain intact
+  Safety gate: 10 commands authorised, 2 denied
 ```
 
-### Wrist camera viewer (separate terminal)
+The guard opens after the first part. The next command is refused, the job
+faults, a reset with the guard still open is refused, and the cell only
+returns to READY after the guard is closed and the fault acknowledged.
 
-```bash
-python wrist_viewer.py
-```
+## Components
 
-### Web interface
+| Part | Where | Notes |
+|---|---|---|
+| Agent loop | `agent_loop.py` | Order decomposition, DONE / DO NOW / NOT YET observation, recipe and degraded modes |
+| Model tools | `core/robot_tools.py` | 11 read-only tools: positions, obstacles, reachability, path checks, pick/place plans |
+| Motion planning | `motion/rrt_planner.py`, `motion/trajectory.py` | RRT* with six strategies; TOPP-RA time-optimal trajectories |
+| Visual servoing | `motion/visual_servoing.py` | Overhead camera alignment before the descent |
+| Grasping | `core/robot.py` | Torque-based contact detection, closed-loop descent, grasp-capture check, gradual release |
+| Placement verifier | `place_verifier.py` | Tolerance check (2 cm, `config.PLACEMENT`), retry, per-slot calibration, honest failure |
+| Safety supervisor | `safety/` | Deterministic gate; reason codes; latching stops |
+| PLC interface | `plc/` | Signal map, handshake, recipes, Modbus TCP, soft PLC for simulation |
+| Audit trail | `audit/` | Hash-chained JSON Lines; `python -m audit.trail <file>` verifies |
+| Robot backends | `hardware/` | PyBullet Panda; UR5e over RTDE (fake-tested only) |
+| Cell definition | `cell/` | Layout, scene builder, factory |
 
-```bash
-python web_server.py
-# Open http://localhost:5000
-```
+Design reasoning: [DESIGN.md](DESIGN.md). Change history:
+[CHANGELOG.md](CHANGELOG.md).
 
----
-
-## Camera Controls
-
-Seven camera presets available as buttons in the PyBullet GUI panel:
-
-| Button | View |
-|--------|------|
-| Camera: Overhead | Top-down view of full table |
-| Camera: Front | Face-on view of robot |
-| Camera: Top | Directly above scene |
-| Camera: Side | Side profile |
-| Camera: Close-up | Zoomed in on gripper area |
-| Camera: Wrist View | Camera moves to gripper position |
-| Camera: Wide | Wide angle full scene |
-
----
-
-## Action Space
+## Action space
 
 | Action | Parameters | Description |
-|--------|-----------|-------------|
-| `pick` | `object` | Pick named object from table only |
-| `place_slot` | `slot` (1/2/3) | Place in numbered conveyor slot |
-| `place` | `x, y` | Place at arbitrary coordinates |
-| `stack` | `object, on` | Stack object on top of another |
-| `scan` | — | Scan scene, refresh object positions |
-| `home` | — | Return robot to home position |
+|---|---|---|
+| `pick` | `object` | Pick a named part from the table |
+| `place_slot` | `slot` | Place in a numbered conveyor slot |
+| `place` | `x, y` | Place at coordinates (checked against the workspace) |
+| `stack` | `object, on` | Stack one part on another |
+| `scan` | | Refresh part positions |
+| `home` | | Return to the home pose |
 
----
+## Cell layout
 
-## Workspace
-
-```
-Robot base at origin (0, 0)
-Table:  x [0.00 – 0.84m],  y [–0.50 – 0.50m]
-
-Reachability zones (Franka Panda, ±110° arc):
-  Grey zone:   dist < 0.25m  — too close
-  Green zone:  0.25 – 0.65m  — safe picking zone
-  Orange zone: 0.65 – 0.75m  — edge of reach
-  Red beyond:  > 0.75m       — out of reach
-
-Conveyor slots:
-  Slot 1: (0.60,  0.25)
-  Slot 2: (0.60,  0.00)
-  Slot 3: (0.60, -0.25)
-
-Starting object positions:
-  Red:   (0.40,  0.00)
-  Blue:  (0.40,  0.30)
-  Green: (0.40, -0.30)
-```
-
----
-
-## Real-World Deployment Note
-
-Object positions in simulation are provided by PyBullet physics (ground truth). In a real deployment this would be replaced by:
-
-- **Intel RealSense D435** depth camera with point cloud segmentation
-- **Calibrated overhead RGB camera** with homography projection (already implemented on UR5 hardware with SensoPart VISOR V20, ±2mm accuracy, 98% detection rate)
-- **Force/torque sensing** for contact-based surface detection — already simulated via joint torque monitoring in this project
-
-The agent interface (observation format and action space) remains identical — only the perception layer changes.
-
----
-
-## Tech Stack
-
-| Component | Technology |
-|-----------|-----------|
-| Physics simulation | PyBullet |
-| Robot URDF | Franka Panda (pybullet_data) |
-| AI reasoning | Claude claude-sonnet-4-20250514 |
-| Motion planning | RRT* (6 strategies) |
-| Trajectory generation | TOPP-RA |
-| Visual perception | OpenCV colour segmentation |
-| Placement verification | place_verifier.py |
-| Calibration | slot_calibration.json |
-| Wrist camera | perception/camera.py |
-| Web interface | Flask + vanilla JS |
-| Language | Python 3.10+ |
-
----
-
-## Project Structure
+Defined once in `cell/layout.py`.
 
 ```
-ai-robot-manipulation/
-├── main.py                  # Entry point, scene setup, camera controls
-├── agent_loop.py            # Autonomous warehouse agent (System 2)
-├── place_verifier.py        # Live placement verification + calibration
-├── wrist_viewer.py          # Live wrist camera popup viewer
-├── slot_calibration.json    # Learned slot offset corrections
-├── config.py                # Robot and simulation config
-├── core/
-│   ├── robot.py             # FrankaPandaRobot — physics-driven pick/place
-│   ├── ai_controller.py     # Claude with tool use
-│   ├── joint_controller.py  # Direct joint control
-│   └── robot_tools.py       # Tool definitions for Claude API
-├── motion/
-│   ├── rrt_planner.py       # RRT* motion planner (6 strategies)
-│   ├── trajectory.py        # TOPP-RA trajectory generator
-│   └── visual_servoing.py   # Camera-guided fine alignment
-├── perception/
-│   ├── camera.py            # Camera system + wrist camera
-│   ├── vision.py            # Claude Vision integration
-│   └── clip_detector.py     # CLIP object detection (optional)
-├── reachability_viz.py      # PyBullet debug visualisation
-├── web_server.py            # Flask web interface
-└── utils/
-    └── logger.py            # Logging system
+Robot base at the origin. Table x 0.00 to 0.84 m, y -0.50 to 0.50 m.
+Reach: under 0.25 m too close; 0.25 to 0.65 m normal; 0.65 to 0.75 m edge; beyond 0.75 m refused.
+Conveyor slots: 1 (0.63, +0.30)   2 (0.63, 0.00)   3 (0.63, -0.30)
+Infeed nests:   red (0.40, 0.00)  blue (0.40, +0.30)  green (0.40, -0.30)
 ```
 
----
+## Limits
+
+- Simulation only. Part positions come from the physics engine; a real cell
+  needs a camera or sensors and their accuracy has to be validated.
+- The UR5e backend has been tested against a fake RTDE interface, not URSim
+  or a robot, and uses straight-line moves without the RRT* planner.
+- The safety supervisor is a software interlock layer, not a safety-rated
+  function. Emergency stop, guarding and speed and force limits belong in
+  safety-rated hardware, following a risk assessment.
+- The language-model path is not covered by the automated tests (it needs an
+  API key). Recipe mode, degraded mode and a failing model client are.
+
+## Other tools
+
+`python wrist_viewer.py` shows the wrist camera. `python web_server.py`
+starts a browser interface on port 5000.
 
 ## Author
 
-Prajjwalit — MSc Advanced Manufacturing Systems, Brunel University London
-Production Support Engineer | Robotics Researcher
+Prajjwalit Singh. MSc Advanced Manufacturing Systems, Brunel University London.
 
 GitHub: [riskerfru/ai-robot-manipulation](https://github.com/riskerfru/ai-robot-manipulation)

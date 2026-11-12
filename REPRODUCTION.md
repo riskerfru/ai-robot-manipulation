@@ -1,17 +1,15 @@
 # Reproduction guide
 
-For someone starting from a clean machine. Matches micro1 deliverable 02.
+From a clean machine to every number in this repository.
 
 ## What you need
 
-| Item | Version / note |
+| Item | Note |
 |---|---|
-| OS | Windows 10+, macOS, or Linux |
-| Python | 3.11 or 3.12 |
-| pip packages | see `requirements.txt` |
-| Data | none. Scene is synthetic PyBullet blocks. `slot_calibration.json` is optional. |
-| API key | **not** required for `pytest` or `eval.py`. Required only for `python main.py` → `auto dispatch…` |
-| Cost | $0 for the scored offline eval. Live Claude dispatch is pay-as-you-go on your key. Do not put the key in git. |
+| OS | Windows 10+, macOS or Linux |
+| Python | 3.11 or newer (tested on 3.13) |
+| Packages | `requirements.txt`; `requirements-industrial.txt` only for Modbus TCP or a real UR robot |
+| API key | Not needed for the tests, `eval.py`, `eval_physics.py` or `run_cell.py`. Needed only for free-text orders in `main.py` |
 
 ## Setup
 
@@ -19,44 +17,7 @@ For someone starting from a clean machine. Matches micro1 deliverable 02.
 git clone https://github.com/riskerfru/ai-robot-manipulation.git
 cd ai-robot-manipulation
 python -m pip install -r requirements.txt
-```
-
-Or unzip this archive and `cd` into the folder, then the same `pip` line.
-
-## Baseline
-
-Typed pick/place with no verifier. In the GUI that is:
-
-```text
-pick up red block
-```
-
-Offline stand-in (same 12 cases as advanced):
-
-```bash
-python eval.py
-```
-
-Look at the `baseline` column.
-
-## Advanced / agent solution
-
-```bash
-python eval.py
-```
-
-Look at the `advanced` column and the METRIC table.
-
-Optional GUI (needs `.env` with `ANTHROPIC_API_KEY=…`, never commit it):
-
-```bash
-python main.py
-```
-
-Then type:
-
-```text
-auto dispatch all blocks to the conveyor
+python -m pip install "pymodbus>=3.16,<4"     # optional: Modbus TCP test
 ```
 
 ## Tests
@@ -65,38 +26,53 @@ auto dispatch all blocks to the conveyor
 python -m pytest -q
 ```
 
-Expected: **10 passed**.
+Expected: **74 passed** in about 20 seconds (71 if `pymodbus` is not
+installed; those three are skipped). Two of the tests run the full cell in
+physics.
 
-## Expected eval output (abridged)
+## The cell under PLC control
 
-```text
-case           baseline  advanced  detail
-accurate_s1    1         1         success, 0.0cm
-…
-off_table      0         1         failed, 999.0cm
-unreachable    1         1         failed, 78.3cm
-
-METRIC                 SIMPLE BASELINE     AGENT SOLUTION      CHANGE
-Primary outcome        0.83 (10/12 ok)     1.00 (12/12 ok)     +0.17
+```bash
+python run_cell.py
+python run_cell.py --scenario guard
+python run_cell.py --scenario estop
+python run_cell.py --scenario plc
 ```
 
-If your numbers differ, you are not on this commit.
+Each run prints the handshake state after every step and finishes with the
+audit-trail check. In the fault scenarios the first job stops with one part
+placed, the first reset is refused, and the second job completes.
 
-## Runtime
+## Placement performance in physics
 
-| Command | Approx. |
-|---|---|
-| `pytest -q` | < 3 s |
-| `python eval.py` | < 2 s |
-| GUI `auto dispatch…` | a few minutes + Claude latency |
+```bash
+python eval_physics.py --orders 20 --workers 2
+```
 
-## Agents in this repo
+About 35 minutes on two cores. Writes `eval_out/physics_eval.md` and the raw
+per-part records. The seeds are fixed, so the counts in `EVAL.md` should
+reproduce on the same package versions; small differences across PyBullet
+builds are possible.
 
-| Agent | File | When it runs |
-|---|---|---|
-| Warehouse orchestrator | `agent_loop.py` (`ORCHESTRATOR_PROMPT`) | GUI `auto …` |
-| Tool-use controller | `core/ai_controller.py` (`SYSTEM_PROMPT`) | GUI natural language |
-| Build agent (this packet) | `trajectories/01_build_agent.md` | already done |
+## Verifier logic check
 
-Instructions that shape each agent: `agent_instructions.md`.
-Traces: `trajectories/`.
+```bash
+python eval.py
+```
+
+Under 2 seconds. Twelve scripted cases against a stub robot
+(`eval_results.txt`).
+
+## Free-text orders through the language model
+
+Create `.env` with `ANTHROPIC_API_KEY=...` (never commit it), then:
+
+```bash
+python main.py
+```
+
+```text
+auto dispatch all blocks to the conveyor
+```
+
+Headless: `SIM_GUI=0 python main.py`.

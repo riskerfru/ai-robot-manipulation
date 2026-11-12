@@ -1,6 +1,7 @@
 # =============================================================
 #   AGENT LOOP - Autonomous Warehouse Order Agent
-#   Fixed version - resolves all 6 identified bugs:
+#   Resolves the six agent failure modes documented in
+#   FAILURE_MODES.md:
 #
 #   Bug 1: Subtask pointer not advancing
 #   Bug 2: Agent picks from occupied slots
@@ -19,14 +20,8 @@ from place_verifier import PlacementVerifier
 from core.robot_tools import RobotTools
 
 
-# Single source of truth for conveyor slot coordinates.
-# Slots sit at x=0.60m so a 15cm placement drift still keeps
-# the object within the robot's ~0.75m reach envelope.
-CONVEYOR_SLOTS = {
-    1: (0.60,  0.25),
-    2: (0.60,  0.00),
-    3: (0.60, -0.25),
-}
+from cell.layout import CONVEYOR_SLOTS   # single source of truth
+from audit.trail import NullAudit
 
 _SLOT_PROMPT_LINES = "\n".join(
     f"  Slot {n}: ({x:.2f}, {y:+.2f})"
@@ -291,26 +286,83 @@ def decompose_order(order, client, model, known_objects=None):
         return [{"action": "scan"}]
 
 
+def deterministic_decision(subtask):
+    """
+    Turn a recipe step straight into an action, with no language
+    model. Used for PLC-selected recipes and in degraded mode.
+    """
+    action = subtask.get("action")
+    params = {k: v for k, v in subtask.items() if k != "action"}
+    return {
+        "thinking": "pre-approved recipe step",
+        "action":   action,
+        "params":   params,
+        "message":  f"recipe step: {subtask}",
+    }
+
+
+def match_recipe(order):
+    """Map a free-text order onto a pre-approved recipe, or None."""
+    from plc.recipes import RECIPES
+    text = (order or "").lower()
+    if "dispatch" in text and ("all" in text or "block" in text
+                               or "part" in text):
+        return list(RECIPES[1]["subtasks"])
+    for recipe in RECIPES.values():
+        if recipe["name"] in text:
+            return list(recipe["subtasks"])
+    return None
+
+
 class WarehouseAgent:
     """
     Autonomous warehouse order fulfilment agent.
     Fixed version with clear subtask tracking.
     """
 
-    def __init__(self, robot, ai_config, logger):
+    def __init__(self, robot, ai_config, logger, audit=None,
+                 verifier=None, llm_enabled=True):
         self.robot       = robot
         self.logger      = logger
-        
-        self.client = anthropic.Anthropic(
-            api_key=ai_config["api_key"],
-            default_headers={"anthropic-workspace-id": "wrkspc_your_id_here"}
-       )
+        self.audit       = audit or NullAudit()
+
+        # The language model is optional. Without it (no key, no
+        # network, or llm_enabled=False) the agent runs pre-approved
+        # recipes through the same gated, verified pipeline.
+        #   llm_enabled=False : recipe mode, by design
+        #   degraded=True     : the model was wanted but is unavailable
+        self.client      = None
+        self.llm_enabled = llm_enabled
+        self.degraded    = False
+        self.degraded_reason = None
+        if llm_enabled:
+            if ai_config.get("api_key"):
+                try:
+                    self.client = anthropic.Anthropic(
+                        api_key=ai_config["api_key"],
+                        timeout=ai_config.get("timeout_s", 20.0),
+                        max_retries=ai_config.get("api_retries", 1),
+                    )
+                except Exception as e:
+                    self._enter_degraded(f"client init failed: {e}")
+            else:
+                self._enter_degraded("no API key configured")
+
         self.model       = ai_config["model"]
         self.e_stop      = EMERGENCY_STOP
         self.max_retries = 3
-        self.verifier = PlacementVerifier(robot)
+        self.verifier = verifier or PlacementVerifier(robot)
         self.tools = RobotTools(robot, logger)
         self.max_tool_turns = 6
+
+    def _enter_degraded(self, reason):
+        """Switch to recipe-only operation. Logged, never silent."""
+        if not self.degraded:
+            print(f"  ⚠️  DEGRADED MODE: {reason} — "
+                  f"continuing without the language model")
+        self.degraded = True
+        self.degraded_reason = reason
+        self.audit.log("degraded_mode", reason=reason)
 
     # Candidate table spots to set a held object down aside, checked
     # in order for reachability and clearance from existing objects.
@@ -339,7 +391,11 @@ class WarehouseAgent:
             return (x, y)
         return None
 
-    def run(self, order):
+    def run(self, order, subtasks=None):
+        """
+        order    : free-text order (decomposed by the language model)
+        subtasks : pre-approved recipe steps; skips decomposition
+        """
         print(f"\n{'='*50}")
         print(f"  🤖 WAREHOUSE AGENT STARTING")
         print(f"  📦 Order: {order}")
@@ -347,6 +403,11 @@ class WarehouseAgent:
 
         self.e_stop.reset()
         self.verifier.load_calibration()
+
+        # A new order gets a fresh attempt at the language model.
+        if self.llm_enabled and self.client is not None:
+            self.degraded = False
+            self.degraded_reason = None
 
         # Reset slot occupancy
         if hasattr(self.robot, "slot_occupants"):
@@ -356,8 +417,21 @@ class WarehouseAgent:
         # Decompose
         known_objects = list(self.robot.objects.keys())
         print(f"  📦 Known objects in scene: {known_objects}")
-        subtasks  = decompose_order(order, self.client, self.model,
-                                    known_objects=known_objects)
+        self.audit.log("order_received", order=order,
+                       recipe=subtasks is not None,
+                       known_objects=known_objects)
+        if subtasks is None:
+            subtasks = self._decompose(order, known_objects)
+        if subtasks is None:
+            reason = (f"language model unavailable "
+                      f"({self.degraded_reason or 'recipe mode'}) and the "
+                      f"order matches no pre-approved recipe")
+            print(f"  ❌ {reason}")
+            failed = [{"task": order, "reason": reason}]
+            self.audit.log("order_result", success=False, failed=failed)
+            return self._build_result(False, [], failed, 0, reason)
+        self.audit.log("order_decomposed", subtasks=subtasks,
+                       degraded=self.degraded)
         remaining  = list(subtasks)
         completed  = []
         failed     = []
@@ -403,9 +477,7 @@ class WarehouseAgent:
                 )
 
                 print(f"\n  👁️  Observing scene...")
-                print(f"  🧠 Claude reasoning (attempt {retries + 1})...")
-
-                decision = self._get_decision(obs, current_subtask, retries)
+                decision = self._decide(obs, current_subtask, retries)
 
                 if not decision:
                     retries += 1
@@ -453,6 +525,8 @@ class WarehouseAgent:
                 last_result = self._execute_action(
                     decision, current_subtask
                 )
+                self.audit.log("action_result", subtask=current_subtask,
+                               result=last_result)
 
                 status_icon = "✅" if last_result["status"] == "success" else "❌"
                 print(f"  {status_icon} Result: "
@@ -491,7 +565,45 @@ class WarehouseAgent:
 
         self.verifier.save_calibration()
         self.verifier.get_calibration_report()
+        self.audit.log("order_result", success=success,
+                       completed=completed, failed=failed,
+                       steps=steps, degraded=self.degraded)
         return self._build_result(success, completed, failed, steps, summary)
+
+    # ----------------------------------------------------------
+    # Language model with deterministic fallback
+    # ----------------------------------------------------------
+
+    def _use_llm(self):
+        return (self.llm_enabled and self.client is not None
+                and not self.degraded)
+
+    def _decompose(self, order, known_objects):
+        """LLM decomposition; falls back to a matching recipe."""
+        if self._use_llm():
+            try:
+                return decompose_order(order, self.client, self.model,
+                                       known_objects=known_objects)
+            except Exception as e:
+                self._enter_degraded(f"decomposition failed: {e}")
+        return match_recipe(order)
+
+    def _decide(self, obs, current_subtask, retries):
+        """Next action: language model, or the recipe step itself."""
+        if self._use_llm():
+            print(f"  🧠 Claude reasoning (attempt {retries + 1})...")
+            self._llm_error = None
+            decision = self._get_decision(obs, current_subtask, retries)
+            if self._llm_error is None:
+                if decision:
+                    self.audit.log("llm_decision", subtask=current_subtask,
+                                   decision=decision)
+                return decision
+            self._enter_degraded(f"decision call failed: {self._llm_error}")
+        decision = deterministic_decision(current_subtask)
+        self.audit.log("recipe_decision", subtask=current_subtask,
+                       decision=decision)
+        return decision
 
     def _get_decision(self, observation, current_subtask, retry_count):
         """
@@ -521,6 +633,7 @@ class WarehouseAgent:
                 )
             except Exception as e:
                 print(f"  ⚠️  Decision error: {e}")
+                self._llm_error = e
                 return None
 
             tool_uses = [b for b in response.content if b.type == "tool_use"]
@@ -543,6 +656,8 @@ class WarehouseAgent:
             tool_results = []
             for block in tool_uses:
                 result_str = self.tools.execute_tool(block.name, block.input)
+                self.audit.log("tool_call", tool=block.name,
+                               input=block.input, result=result_str[:500])
                 tool_results.append({
                     "type":        "tool_result",
                     "tool_use_id": block.id,
@@ -713,6 +828,14 @@ class WarehouseAgent:
                             "detail": "not holding anything"}
 
                 held_obj = self.robot.grasped_object
+                commanded = None
+                if slot_num is not None:
+                    # Send the robot to the calibrated position so a
+                    # known slot offset is corrected on the first place.
+                    correct = getattr(self.verifier, "corrected_target", None)
+                    if correct:
+                        commanded = correct(x_final, y_final, slot_num)
+                        x_final, y_final = commanded
                 result   = self.robot.place_object(x_final, y_final)
 
                 # Update slot occupancy on success
@@ -724,8 +847,10 @@ class WarehouseAgent:
                         sx, sy = slots[slot_num]
                         verify = self.verifier.verify_and_fix(
                             held_obj, sx, sy,
-                            slot_num=slot_num
+                            slot_num=slot_num, commanded=commanded
                         )
+                        self.audit.log("verification", part=held_obj,
+                                       slot=slot_num, result=verify)
                         if verify["status"] == "failed":
                             return {
                                 "action": "place",
@@ -834,6 +959,8 @@ class WarehouseAgent:
             return True
         if action == "stack" and completed in ["stack", "place"]:
             return True
+        if action == "place_slot" and completed in ["place", "place_slot"]:
+            return True
         return False
 
     def _build_summary(self, completed, failed, steps):
@@ -851,5 +978,6 @@ class WarehouseAgent:
             "completed":   completed,
             "failed":      failed,
             "steps_taken": steps,
-            "summary":     summary
+            "summary":     summary,
+            "degraded":    self.degraded,
         }

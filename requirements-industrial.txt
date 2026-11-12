@@ -1,0 +1,3 @@
+# Optional: only needed to talk to real plant equipment.
+pymodbus>=3.16,<4      # Modbus TCP link to the cell PLC (plc/bus.py)
+ur_rtde>=1.5           # UR e-Series backend (hardware/ur_rtde.py)
