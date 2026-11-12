@@ -37,10 +37,10 @@ def build_cell(robot, part_positions=None, gui=False, settle_steps=100):
     table_col = p.createCollisionShape(p.GEOM_BOX, halfExtents=[hx, hy, hz])
     table_vis = p.createVisualShape(p.GEOM_BOX, halfExtents=[hx, hy, hz],
                                     rgbaColor=[0.55, 0.35, 0.15, 1.0])
-    p.createMultiBody(baseMass=0,
-                      baseCollisionShapeIndex=table_col,
-                      baseVisualShapeIndex=table_vis,
-                      basePosition=[L.TABLE_CENTRE[0], L.TABLE_CENTRE[1], hz])
+    table_id = p.createMultiBody(
+        baseMass=0, baseCollisionShapeIndex=table_col,
+        baseVisualShapeIndex=table_vis,
+        basePosition=[L.TABLE_CENTRE[0], L.TABLE_CENTRE[1], hz])
 
     positions = part_positions or L.PART_NESTS
     for name, (x, y) in positions.items():
@@ -52,20 +52,21 @@ def build_cell(robot, part_positions=None, gui=False, settle_steps=100):
     conv_vis = p.createVisualShape(
         p.GEOM_BOX, halfExtents=[0.08, 0.44, 0.005],
         rgbaColor=[0.15, 0.15, 0.15, 1.0])
-    p.createMultiBody(baseMass=0,
-                      baseCollisionShapeIndex=conv_col,
-                      baseVisualShapeIndex=conv_vis,
-                      basePosition=[L.SLOT_X, 0.0, L.TABLE_Z + 0.005])
+    conveyor_id = p.createMultiBody(
+        baseMass=0, baseCollisionShapeIndex=conv_col,
+        baseVisualShapeIndex=conv_vis,
+        basePosition=[L.SLOT_X, 0.0, L.TABLE_Z + 0.005])
 
     w = L.SLOT_HALF_W
+    slot_ids = {}
     for slot_num, (sx, sy) in L.CONVEYOR_SLOTS.items():
         sc = p.createCollisionShape(p.GEOM_BOX, halfExtents=[w, w, 0.004])
         sv = p.createVisualShape(p.GEOM_BOX, halfExtents=[w, w, 0.004],
                                  rgbaColor=[0.85, 0.85, 0.85, 1.0])
-        p.createMultiBody(baseMass=0,
-                          baseCollisionShapeIndex=sc,
-                          baseVisualShapeIndex=sv,
-                          basePosition=[sx, sy, L.TABLE_Z + 0.012])
+        slot_ids[slot_num] = p.createMultiBody(
+            baseMass=0, baseCollisionShapeIndex=sc,
+            baseVisualShapeIndex=sv,
+            basePosition=[sx, sy, L.TABLE_Z + 0.012])
         if gui:
             p.addUserDebugText(text=str(slot_num),
                                textPosition=[sx, sy, L.TABLE_Z + 0.08],
@@ -76,6 +77,8 @@ def build_cell(robot, part_positions=None, gui=False, settle_steps=100):
 
     robot.conveyor_slots = dict(L.CONVEYOR_SLOTS)
     robot.slot_occupants = {}
+    robot.cell_bodies = {"table": table_id, "conveyor": conveyor_id,
+                         "slots": slot_ids}
 
     for _ in range(settle_steps):
         robot.step()

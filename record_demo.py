@@ -1,0 +1,585 @@
+#!/usr/bin/env python3
+# =============================================================
+#   RECORD DEMO - renders the cell to a video with a status panel
+#
+#   Runs the simulated cell headless and writes an MP4: the cell
+#   on the left, and on the right what the controller knows at
+#   that moment (order, task list, cell and safety state, the
+#   last placement measurement, recent audit events).
+#
+#   python record_demo.py normal      one PLC job, three parts
+#   python record_demo.py guard       guard door opens mid-job
+#   python record_demo.py verify      the same knocked part, without
+#                                     and with placement measurement
+#   python record_demo.py order --text "dispatch all blocks to the conveyor"
+#                                     free-text order through the language
+#                                     model (needs ANTHROPIC_API_KEY)
+#
+#   Needs ffmpeg on the PATH. The panel is drawn from the audit
+#   trail and the PLC signals, so it shows what was recorded,
+#   not a script written for the video.
+# =============================================================
+
+import argparse
+import contextlib
+import io
+import math
+import os
+import shutil
+import subprocess
+import sys
+
+import numpy as np
+import pybullet as p
+from PIL import Image, ImageDraw, ImageFont
+
+import config as cfg
+from cell import layout as L
+from cell.dressing import CellDressing
+from cell.factory import build_sim_cell
+from plc.cell_controller import CellState
+from plc.recipes import RECIPES
+from utils.logger import NullLogger
+
+W, H = 1280, 720
+SCENE_W = 848
+PANEL_X = SCENE_W
+FPS = 24
+STEPS_PER_FRAME = 60            # 0.25 s of simulated time per frame
+SPEED = STEPS_PER_FRAME / 240 * FPS
+
+BG     = (18, 22, 28)
+CARD   = (28, 34, 43)
+LINE   = (48, 56, 68)
+TEXT   = (232, 236, 241)
+MUTED  = (139, 148, 162)
+GREEN  = (61, 190, 123)
+AMBER  = (242, 179, 61)
+RED    = (229, 84, 88)
+BLUE   = (104, 160, 255)
+
+FONT_DIRS = ["/usr/share/fonts/opentype/inter", "/usr/share/fonts/truetype/dejavu",
+             "C:/Windows/Fonts", "/System/Library/Fonts/Supplemental",
+             "/Library/Fonts"]
+FONT_FILES = {
+    "regular": ["Inter-Regular.otf", "DejaVuSans.ttf", "segoeui.ttf", "Arial.ttf"],
+    "bold":    ["Inter-SemiBold.otf", "DejaVuSans-Bold.ttf", "segoeuib.ttf",
+                "Arial Bold.ttf"],
+    "mono":    ["DejaVuSansMono.ttf", "consola.ttf", "Courier New.ttf"],
+}
+
+
+def font(kind, size):
+    for name in FONT_FILES[kind]:
+        for folder in FONT_DIRS:
+            path = os.path.join(folder, name)
+            if os.path.exists(path):
+                return ImageFont.truetype(path, size)
+    return ImageFont.load_default()
+
+
+F_TITLE = font("bold", 22)
+F_LABEL = font("bold", 12)
+F_BODY  = font("regular", 16)
+F_BOLD  = font("bold", 16)
+F_SMALL = font("regular", 13)
+F_MONO  = font("mono", 13)
+F_CARD_T = font("bold", 44)
+F_CARD_B = font("regular", 24)
+
+
+def describe(subtask):
+    action = subtask.get("action")
+    if action == "pick":
+        return f"Pick {subtask.get('object')}"
+    if action == "place_slot":
+        return f"Place in slot {subtask.get('slot')}"
+    if action == "place":
+        return f"Place at ({subtask.get('x')}, {subtask.get('y')})"
+    if action == "stack":
+        return f"Stack {subtask.get('object')} on {subtask.get('on')}"
+    return str(action).capitalize()
+
+
+class Hud:
+    """Everything the panel shows. Filled from audit events."""
+
+    def __init__(self, title, subtitle, footer):
+        self.title, self.subtitle, self.footer = title, subtitle, footer
+        self.order_source = ""
+        self.order_text = ""
+        self.tasks = []                  # [text, status]
+        self.cell_state = "READY"
+        self.safety_state = "RUN"
+        self.guard_closed = True
+        self.measure = ("No placement yet", MUTED)
+        self.events = []                 # (time_s, text, colour)
+        self.truth = None                # [(part, drift_cm, ok)]
+        self.sim_time = 0.0
+        self.measured = True
+
+    def event(self, text, colour=TEXT):
+        self.events.append((self.sim_time, text, colour))
+        del self.events[:-6]
+
+    # ---- audit trail -> panel ------------------------------------
+    def on_audit(self, name, d):
+        if name == "job_start":
+            self.order_source = f"PLC job {d['job_id']}  ·  recipe {d['recipe']}"
+            self.order_text = d.get("name", "")
+            self.truth = None
+            self.event(f"PLC: JOB_START job {d['job_id']}", BLUE)
+        elif name == "order_received":
+            if not d.get("recipe"):
+                self.order_source = "Operator, free text"
+            self.order_text = d.get("order", self.order_text)
+        elif name == "order_decomposed":
+            self.tasks = [[describe(s), "pending"] for s in d["subtasks"]]
+        elif name in ("recipe_decision", "llm_decision"):
+            for task in self.tasks:
+                if task[1] in ("pending", "current"):
+                    task[1] = "current"
+                    break
+            if name == "llm_decision":
+                action = d.get("decision", {}).get("action", "?")
+                self.event(f"Model requests: {action}", BLUE)
+        elif name == "tool_call":
+            self.event(f"Model reads: {d.get('tool')}", MUTED)
+        elif name == "action_result":
+            ok = d["result"].get("status") == "success"
+            for task in self.tasks:
+                if task[1] == "current":
+                    task[1] = "done" if ok else "failed"
+                    break
+            if not ok:
+                self.event(f"Failed: {d['result'].get('detail', '')[:44]}", RED)
+        elif name == "safety_decision" and not d.get("allowed", True):
+            self.event(f"Safety gate DENIED {d['kind']}: {d['reason']}", RED)
+        elif name == "safety_trip":
+            self.safety_state = d.get("state", self.safety_state)
+            self.event(f"SAFETY STOP: {d.get('reason', '')}", RED)
+        elif name == "verification":
+            r = d["result"]
+            part, slot = d["part"], d["slot"]
+            if not self.measured:
+                self.measure = (f"{part} in slot {slot}: not measured, "
+                                f"reported as placed", AMBER)
+            elif r["status"] == "success":
+                extra = " after re-placing" if r.get("retried") else ""
+                self.measure = (f"{part} in slot {slot}: {r['drift_cm']:.1f} cm, "
+                                f"in tolerance{extra}", GREEN)
+                self.event(f"Measured {part}: {r['drift_cm']:.1f} cm, OK", GREEN)
+            else:
+                self.measure = (f"{part}: {r['detail'][:46]}", RED)
+                self.event(f"Measured {part}: FAILED", RED)
+        elif name == "job_done":
+            self.event(f"PLC: DONE, {d['parts_ok']} parts reported placed", GREEN)
+        elif name == "job_fault":
+            self.event(f"PLC: FAULT {d['code']} ({d['reason']})", RED)
+        elif name == "fault_reset":
+            if d.get("allowed"):
+                self.safety_state = "RUN"
+                self.event("Fault reset accepted", GREEN)
+            else:
+                self.event(f"Reset refused: {d['reason'].replace('cannot reset: ', '')}",
+                           AMBER)
+        elif name == "cell_state":
+            self.cell_state = d["state"]
+        elif name == "degraded_mode":
+            self.event("Language model unavailable: recipe mode", AMBER)
+
+    # ---- drawing -------------------------------------------------
+    def draw(self, scene):
+        img = Image.new("RGB", (W, H), BG)
+        img.paste(scene, (0, 0))
+        d = ImageDraw.Draw(img)
+        x0, x1 = PANEL_X + 24, W - 24
+        y = 22
+
+        d.text((x0, y), self.title, font=F_TITLE, fill=TEXT)
+        y += 30
+        d.text((x0, y), self.subtitle, font=F_SMALL, fill=MUTED)
+        y += 30
+
+        def label(text):
+            nonlocal y
+            d.line([(x0, y), (x1, y)], fill=LINE, width=1)
+            y += 12
+            d.text((x0, y), text.upper(), font=F_LABEL, fill=MUTED)
+            y += 22
+
+        label("Order")
+        d.text((x0, y), self.order_source or "Waiting for a job",
+               font=F_SMALL, fill=BLUE)
+        y += 20
+        d.text((x0, y), self.order_text[:44] or "-", font=F_BODY, fill=TEXT)
+        y += 30
+
+        label("Tasks")
+        marks = {"done": ("✓", GREEN), "current": ("▶", BLUE),
+                 "pending": ("○", MUTED), "failed": ("✕", RED)}
+        for text, status in self.tasks[:7] or [["-", "pending"]]:
+            mark, colour = marks[status]
+            d.text((x0, y), mark, font=F_MONO, fill=colour)
+            d.text((x0 + 24, y - 2), text,
+                   font=F_BOLD if status == "current" else F_BODY,
+                   fill=TEXT if status != "pending" else MUTED)
+            y += 23
+        y += 8
+
+        label("Cell")
+        self._pill(d, x0, y, "CELL " + self.cell_state,
+                   {"READY": GREEN, "BUSY": BLUE, "DONE": GREEN,
+                    "FAULT": RED}.get(self.cell_state, MUTED))
+        self._pill(d, x0 + 150, y, "SAFETY " + self.safety_state.replace("_", " "),
+                   GREEN if self.safety_state == "RUN" else RED)
+        y += 34
+        d.text((x0, y), "Guard door: " + ("closed" if self.guard_closed else "OPEN"),
+               font=F_SMALL, fill=MUTED if self.guard_closed else RED)
+        y += 28
+
+        label("Last placement")
+        d.text((x0, y), self.measure[0], font=F_BODY, fill=self.measure[1])
+        y += 32
+
+        if self.truth is not None:
+            label("True position (simulator)")
+            for part, drift, ok in self.truth:
+                d.text((x0, y), "✓" if ok else "✕", font=F_MONO,
+                       fill=GREEN if ok else RED)
+                d.text((x0 + 24, y - 2),
+                       f"{part}: {drift:.1f} cm from slot centre",
+                       font=F_BODY, fill=TEXT if ok else RED)
+                y += 22
+        else:
+            label("Audit trail")
+            for t, text, colour in self.events[-5:]:
+                d.text((x0, y), f"{t:6.1f}s", font=F_MONO, fill=MUTED)
+                d.text((x0 + 68, y - 1), text[:40], font=F_SMALL, fill=colour)
+                y += 21
+
+        d.text((x0, H - 30), self.footer, font=F_SMALL, fill=MUTED)
+        d.text((16, H - 30), f"Simulation  ·  {SPEED:.0f}x speed  ·  "
+               f"t = {self.sim_time:5.1f} s", font=F_SMALL, fill=(70, 76, 86))
+        return img
+
+    @staticmethod
+    def _pill(d, x, y, text, colour):
+        w = int(d.textlength(text, font=F_LABEL)) + 22
+        d.rounded_rectangle([x, y, x + w, y + 24], radius=12, fill=colour)
+        d.text((x + 11, y + 5), text, font=F_LABEL, fill=BG)
+
+
+class Recorder:
+    """Captures a frame every STEPS_PER_FRAME physics steps."""
+
+    def __init__(self, path):
+        if not shutil.which("ffmpeg"):
+            sys.exit("ffmpeg not found on the PATH")
+        os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+        self.path = path
+        self.proc = subprocess.Popen(
+            ["ffmpeg", "-y", "-loglevel", "error", "-f", "rawvideo",
+             "-pix_fmt", "rgb24", "-s", f"{W}x{H}", "-r", str(FPS),
+             "-i", "-", "-c:v", "libx264", "-pix_fmt", "yuv420p",
+             "-crf", "20", "-movflags", "+faststart", path],
+            stdin=subprocess.PIPE)
+        self.view = p.computeViewMatrixFromYawPitchRoll(
+            [0.36, 0.0, 0.26], 2.05, 38, -36, 0, 2)
+        self.proj = p.computeProjectionMatrixFOV(42, SCENE_W / H, 0.1, 6)
+        self.hud = None
+        self.steps = 0
+        self.frames = 0
+        self.last = None
+        self._orig_step = p.stepSimulation
+        p.stepSimulation = self._step
+
+    def _step(self, *a, **k):
+        out = self._orig_step(*a, **k)
+        self.steps += 1
+        if self.hud is not None:
+            self.hud.sim_time = self.steps / 240
+            if self.steps % STEPS_PER_FRAME == 0:
+                self.frame()
+        return out
+
+    def _write(self, img):
+        self.proc.stdin.write(img.tobytes())
+        self.frames += 1
+
+    def frame(self):
+        raw = p.getCameraImage(SCENE_W, H, self.view, self.proj,
+                               renderer=p.ER_TINY_RENDERER, shadow=1,
+                               lightDirection=[0.6, -0.5, 1.6])
+        scene = Image.fromarray(
+            np.reshape(raw[2], (H, SCENE_W, 4))[:, :, :3].astype("uint8"))
+        self.last = self.hud.draw(scene)
+        self._write(self.last)
+
+    def hold(self, seconds):
+        """Freeze on the current state so it can be read."""
+        self.frame()
+        for _ in range(int(seconds * FPS)):
+            self._write(self.last)
+
+    def card(self, heading, lines, seconds=3.0):
+        img = Image.new("RGB", (W, H), BG)
+        d = ImageDraw.Draw(img)
+        d.text((96, 250), heading, font=F_CARD_T, fill=TEXT)
+        y = 330
+        for line in lines:
+            d.text((96, y), line, font=F_CARD_B, fill=MUTED)
+            y += 38
+        for _ in range(int(seconds * FPS)):
+            self._write(img)
+
+    def close(self):
+        p.stepSimulation = self._orig_step
+        self.proc.stdin.close()
+        self.proc.wait()
+        print(f"wrote {self.path}  ({self.frames / FPS:.0f} s, "
+              f"{self.frames} frames)", file=sys.__stdout__)
+
+
+# ---- cell set-up ---------------------------------------------
+
+def make_cell(rec, hud, llm=False):
+    """Build a cell and connect it to the recorder and the panel."""
+    with contextlib.redirect_stdout(io.StringIO()):
+        cell = build_sim_cell(NullLogger(), llm_enabled=llm)
+    cell.dressing = CellDressing(cell.robot)
+    original_log = cell.audit.log
+
+    def log(event, **payload):
+        record = original_log(event, **payload)
+        hud.on_audit(event, payload)
+        light = ("red" if hud.cell_state == "FAULT" or hud.safety_state != "RUN"
+                 else "amber" if hud.cell_state == "BUSY" else "green")
+        cell.dressing.set_light(light)
+        return record
+
+    cell.audit.log = log
+    rec.hud = hud
+    return cell
+
+
+def quiet(fn, *a, **k):
+    with contextlib.redirect_stdout(io.StringIO()):
+        return fn(*a, **k)
+
+
+def set_guard(cell, hud, closed):
+    (cell.soft_plc.close_guard if closed else cell.soft_plc.open_guard)()
+    cell.dressing.set_guard(closed)
+    hud.guard_closed = closed
+    hud.event("Guard door closed" if closed else "Guard door OPENED",
+              GREEN if closed else RED)
+
+
+def show_truth(cell, hud, recipe=1):
+    """Compare each part with its slot using the simulator's ground truth."""
+    truth = []
+    steps = RECIPES[recipe]["subtasks"]
+    for pick, place in zip(steps[0::2], steps[1::2]):
+        part = pick["object"]
+        sx, sy = cell.robot.conveyor_slots[place["slot"]]
+        pos = cell.robot.get_object_position(part)
+        drift = 100 * math.hypot(pos[0] - sx, pos[1] - sy)
+        truth.append((part, drift,
+                      drift <= 100 * cfg.PLACEMENT["tolerance_m"]))
+    hud.truth = truth
+
+
+def after_first_place(cell, action):
+    """Run `action` once, right after the first part is released."""
+    backend = cell.robot
+    original = backend.place_object
+    fired = {"done": False}
+
+    def place(x, y, stack_on=None):
+        out = original(x, y, stack_on=stack_on)
+        if not fired["done"]:
+            fired["done"] = True
+            action()
+        return out
+
+    backend.place_object = place
+
+
+def knock_part(cell, hud, on_place_number, dx, dy):
+    """Shift a part after release, as a slip or a bump would."""
+    backend = cell.robot
+    original = backend.place_object
+    count = {"n": 0}
+
+    def place(x, y, stack_on=None):
+        held = backend.grasped_object
+        out = original(x, y, stack_on=stack_on)
+        count["n"] += 1
+        if count["n"] == on_place_number and held:
+            body = backend.objects[held]["id"]
+            pos, orn = p.getBasePositionAndOrientation(body)
+            p.resetBasePositionAndOrientation(
+                body, [pos[0] + dx, pos[1] + dy, pos[2] + 0.005], orn)
+            p.resetBaseVelocity(body, [0, 0, 0], [0, 0, 0])
+            hud.event(f"Disturbance: {held} knocked "
+                      f"{100 * math.hypot(dx, dy):.0f} cm", AMBER)
+            for _ in range(60):
+                backend.step()
+        return out
+
+    backend.place_object = place
+
+
+def announce_retries(cell, hud):
+    """Put each out-of-tolerance measurement on the panel as it happens."""
+    verifier = cell.verifier
+    original = verifier.verify_and_fix
+
+    def verify(name, tx, ty, slot_num=None, attempt=0, commanded=None):
+        pos = cell.supervised.get_object_position(name)
+        if pos:
+            drift = math.hypot(pos[0] - tx, pos[1] - ty)
+            if drift >= verifier.drift_retry and attempt < verifier.max_retries:
+                hud.measure = (f"{name}: {100 * drift:.1f} cm, out of tolerance, "
+                               f"re-placing ({attempt + 1}/{verifier.max_retries})",
+                               AMBER)
+                hud.event(f"Measured {name}: {100 * drift:.1f} cm, re-placing",
+                          AMBER)
+        return original(name, tx, ty, slot_num=slot_num, attempt=attempt,
+                        commanded=commanded)
+
+    verifier.verify_and_fix = verify
+
+
+def run_job(cell, job_id, recipe=1):
+    cell.soft_plc.request_job(job_id, recipe)
+    return quiet(cell.controller.poll)
+
+
+# ---- scenarios -----------------------------------------------
+
+def scenario_normal(rec):
+    hud = Hud("PLC-run job", "The cell PLC selects a recipe; every placement is measured",
+              "Recipe mode: no language model in this run")
+    cell = make_cell(rec, hud)
+    announce_retries(cell, hud)
+    quiet(cell.controller.poll)
+    rec.hold(1.5)
+    run_job(cell, 1001)
+    show_truth(cell, hud)
+    rec.hold(4.0)
+    cell.soft_plc.stop()
+
+
+def scenario_guard(rec):
+    hud = Hud("Guard door opens mid-job", "The safety gate refuses motion; the PLC sees a fault",
+              "Recipe mode: no language model in this run")
+    cell = make_cell(rec, hud)
+    announce_retries(cell, hud)
+    after_first_place(cell, lambda: set_guard(cell, hud, False))
+    quiet(cell.controller.poll)
+    rec.hold(1.5)
+
+    state = run_job(cell, 1001)
+    rec.hold(3.0)
+    if state is CellState.FAULT:
+        cell.soft_plc.reset_fault()            # cause still present
+        quiet(cell.controller.poll)
+        rec.hold(3.0)
+        cell.soft_plc.release_reset()
+        quiet(cell.controller.poll)
+
+        set_guard(cell, hud, True)
+        import time
+        time.sleep(0.1)
+        quiet(cell.controller.poll)
+        cell.soft_plc.reset_fault()
+        quiet(cell.controller.poll)
+        cell.soft_plc.release_reset()
+        quiet(cell.controller.poll)
+        rec.hold(2.5)
+
+    # The interrupted order is finished by a new job on the same parts.
+    hud.tasks = []
+    run_job(cell, 1002, recipe=1)
+    rec.hold(3.5)
+    cell.soft_plc.stop()
+
+
+def scenario_verify(rec):
+    from eval_physics import OpenLoopVerifier
+    knock = dict(on_place_number=2, dx=0.0, dy=0.09)
+
+    rec.card("Without measurement",
+             ["The second part is knocked 9 cm after the gripper lets go.",
+              "The controller does not measure. It reports the job as done."])
+    hud = Hud("Without measurement", "The part is knocked after release; nothing checks it",
+              "Recipe mode: no language model in this run")
+    hud.measured = False
+    cell = make_cell(rec, hud)
+    cell.agent.verifier = OpenLoopVerifier()
+    knock_part(cell, hud, **knock)
+    quiet(cell.controller.poll)
+    rec.hold(1.0)
+    run_job(cell, 2001)
+    show_truth(cell, hud)
+    rec.hold(5.0)
+    cell.soft_plc.stop()
+    rec.hud = None
+    p.disconnect()
+
+    rec.card("With measurement",
+             ["The same knock, on the same part.",
+              "The controller measures every placement before reporting it."])
+    hud = Hud("With measurement", "Measure, re-place if out of tolerance, or report failure",
+              "Recipe mode: no language model in this run")
+    cell = make_cell(rec, hud)
+    announce_retries(cell, hud)
+    knock_part(cell, hud, **knock)
+    quiet(cell.controller.poll)
+    rec.hold(1.0)
+    run_job(cell, 2002)
+    show_truth(cell, hud)
+    rec.hold(5.0)
+    cell.soft_plc.stop()
+
+
+def scenario_order(rec, text):
+    if not cfg.ANTHROPIC_API_KEY:
+        sys.exit("ANTHROPIC_API_KEY is not set; this scenario needs the "
+                 "language model")
+    hud = Hud("Free-text order", "The model requests actions; code decides and measures",
+              f"Language model: {cfg.AI['model']}")
+    cell = make_cell(rec, hud, llm=True)
+    announce_retries(cell, hud)
+    rec.hold(1.5)
+    quiet(cell.agent.run, text)
+    rec.hold(4.0)
+    cell.soft_plc.stop()
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("scenario", choices=["normal", "guard", "verify", "order"])
+    ap.add_argument("--text", default="dispatch all blocks to the conveyor")
+    ap.add_argument("--out", default=None)
+    args = ap.parse_args()
+
+    out = args.out or os.path.join("demo_out", f"{args.scenario}.mp4")
+    rec = Recorder(out)
+    try:
+        if args.scenario == "normal":
+            scenario_normal(rec)
+        elif args.scenario == "guard":
+            scenario_guard(rec)
+        elif args.scenario == "verify":
+            scenario_verify(rec)
+        else:
+            scenario_order(rec, args.text)
+    finally:
+        rec.close()
+
+
+if __name__ == "__main__":
+    main()

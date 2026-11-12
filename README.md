@@ -79,12 +79,24 @@ git clone https://github.com/riskerfru/ai-robot-manipulation.git
 cd ai-robot-manipulation
 pip install -r requirements.txt
 
-python -m pytest -q                     # 74 tests, about 20 s
+python -m pytest -q                     # 77 tests, about 20 s
 python run_cell.py                      # two PLC jobs, headless, no API key
 python run_cell.py --scenario guard     # guard door opens mid-job
 python run_cell.py --gui                # watch it
 python eval_physics.py --orders 20      # the numbers above (about 35 min)
 ```
+
+Demo videos with a live status panel (needs `ffmpeg`):
+
+```bash
+python record_demo.py normal            # one PLC job
+python record_demo.py guard             # guard door opens mid-job
+python record_demo.py verify            # a knocked part, without and with measurement
+python record_demo.py order --text "dispatch all blocks to the conveyor"   # needs the API key
+```
+
+Videos are written to `demo_out/`. The panel is drawn from the audit trail
+and the PLC signals.
 
 Free-text orders need an Anthropic API key in `.env`
 (`ANTHROPIC_API_KEY=...`, never commit it):
@@ -137,7 +149,8 @@ returns to READY after the guard is closed and the fault acknowledged.
 | PLC interface | `plc/` | Signal map, handshake, recipes, Modbus TCP, soft PLC for simulation |
 | Audit trail | `audit/` | Hash-chained JSON Lines; `python -m audit.trail <file>` verifies |
 | Robot backends | `hardware/` | PyBullet Panda; UR5e over RTDE (fake-tested only) |
-| Cell definition | `cell/` | Layout, scene builder, factory |
+| Cell definition | `cell/` | Layout, scene builder, factory, visual dressing for recordings |
+| Demo recorder | `record_demo.py` | Headless video with a status panel driven by the audit trail |
 
 Design reasoning: [DESIGN.md](DESIGN.md). Change history:
 [CHANGELOG.md](CHANGELOG.md).
