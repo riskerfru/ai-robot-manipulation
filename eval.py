@@ -1,12 +1,14 @@
 #!/usr/bin/env python3
-"""Fair baseline vs advanced eval (micro1 brief).
+"""Verifier logic check: 12 fixed cases against a stub robot.
 
-Same 12 cases for both sides. No GUI. No API key.
+No physics, no GUI, no API key, under 2 seconds. The stub robot reports a
+scripted part position and lands every retry exactly on target, so this
+checks the verifier's decisions (accept, retry, fail honestly), not how well
+placements work. For measured placement performance in the real simulation
+run eval_physics.py.
 
-Baseline  = scripted place: if the block is on the table, call it done.
-Advanced  = PlacementVerifier (retry, calibration, honest fail).
-
-Primary metric: honest placement outcome (would a cell operator accept this).
+Baseline  = no verification: if the part is on the table, call it placed.
+Verifier  = PlacementVerifier (retry, calibration, honest failure).
 """
 
 from __future__ import annotations
@@ -73,7 +75,7 @@ def main() -> None:
     base_pass = 0
     adv_pass = 0
     rows = []
-    print("case           baseline  advanced  detail")
+    print("case           no-verify verifier  detail")
     for name, pos, tx, ty, reachable, dist in CASES:
         b = baseline_ok(pos)
         v = PlacementVerifier(FakeRobot(pos, reachable=reachable, distance=dist))
@@ -86,21 +88,11 @@ def main() -> None:
         rows.append((name, b, a, detail))
 
     n = len(CASES)
-    bmean = base_pass / n
-    amean = adv_pass / n
     print()
-    print("METRIC                 SIMPLE BASELINE     AGENT SOLUTION      CHANGE")
-    print(f"Primary outcome        {bmean:.2f} ({base_pass}/{n} ok)     {amean:.2f} ({adv_pass}/{n} ok)     {amean - bmean:+.2f}")
-    print("Human time / order     ~90 s watching      ~10 s one command   ~8x faster (est.)")
-    print("Cost / offline eval    $0                  $0                  $0")
-    print("Cost / live dispatch   $0 (typed cmds)     Claude API ~$0.05–0.20 / order (est., not billed here)")
-    print()
-    print("HARD CASE  off_table:    block fell (z=0.01). Baseline 0. Advanced fails honestly.")
-    print("HARD CASE  unreachable:  78 cm off slot, out of reach. Baseline 1 (still 'placed').")
-    print("                         Advanced tries rescue, then failed + human intervention.")
-    print("demo_advanced            6/6 subtasks in 9 steps  (README recorded GUI run, needs API key)")
-    print("runtime                  < 2 s offline; a few minutes for one GUI auto-dispatch")
-    print(f"cases                    {n} (same inputs both sides)")
+    print(f"Counted as placed with no verification: {base_pass}/{n} "
+          f"(three of them are 9, 15 and 78 cm off target)")
+    print(f"Verifier decision correct: {adv_pass}/{n}")
+    print("Stub robot, scripted positions. See eval_physics.py for physics.")
 
 
 if __name__ == "__main__":

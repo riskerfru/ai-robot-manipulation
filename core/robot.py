@@ -20,11 +20,26 @@ from motion.rrt_planner import RRTPlanner
 from motion.trajectory import TrajectoryPlanner
 from perception.camera import CameraSystem
 from motion.visual_servoing import VisualServoing
+from cell.layout import CONVEYOR_SLOTS
 
 
 class FrankaPandaRobot:
+
+    # A part further than this from the gripper centre when the
+    # fingers close is not between them: the pick is a miss.
+    GRASP_CAPTURE_RADIUS = 0.02   # m, across the fingers
+    GRASP_CAPTURE_HEIGHT = 0.03   # m, along the fingers
+    GRASP_DEPTH = 0.012           # m, gripper point below part centre
+
     def __init__(self, config, logger):
         self.config        = config
+        self._tool_orn     = None
+        self._ik_limits    = None
+        self._insertion    = None
+        self.on_force      = None     # optional callback(z, force_n)
+        self.use_force_sensing = True # False: comparison runs only
+        self.pockets       = {}       # part name -> nominal pocket
+        self.stations      = {}       # part name -> supply station (x, y)
         self.logger        = logger
         self.robot_config  = config["robot_limits"]
         self.sim_config    = config["sim"]
@@ -50,13 +65,8 @@ class FrankaPandaRobot:
         self.grasp_constraint = None
         self.grasped_object   = None
 
-        # FIX: Correct slot positions - all different, within safe reach
-        # Slots at x=0.60m max - even with 15cm drift stays within 0.75m
-        self.conveyor_slots = {
-            1: (0.60,  0.25),   # slot 1 - right
-            2: (0.60,  0.00),   # slot 2 - centre
-            3: (0.60, -0.25),   # slot 3 - left
-        }
+        # Slot positions come from the cell layout (single source of truth)
+        self.conveyor_slots = dict(CONVEYOR_SLOTS)
         self.slot_occupants = {}
 
         self.rrt.set_workspace_limits(
@@ -239,7 +249,8 @@ class FrankaPandaRobot:
     # Scene management
     # ----------------------------------------------------------
 
-    def add_object(self, name, x, y, color, z=0.05, half_extent=0.025):
+    def add_object(self, name, x, y, color, z=0.05, half_extent=0.025,
+                   grasp_depth=None):
         col    = p.createCollisionShape(
             p.GEOM_BOX, halfExtents=[half_extent] * 3
         )
@@ -265,7 +276,9 @@ class FrankaPandaRobot:
 
         self.objects[name] = {
             "id": obj_id, "color": color, "position": [x, y, z],
-            "half_extent": half_extent
+            "half_extent": half_extent,
+            "grasp_depth": (self.GRASP_DEPTH if grasp_depth is None
+                            else grasp_depth)
         }
         self.logger.info(f"Added object '{name}' at ({x}, {y}, {z})")
         self._sync_obstacles()
@@ -390,7 +403,39 @@ class FrankaPandaRobot:
         self._execute_trajectory(trajectory, velocities)
         return True
 
-    def _direct_move(self, x, y, z, speed_factor=1.0):
+    def _down_orientation(self):
+        """
+        Gripper pointing straight down with the fingers square to
+        the cell axes, at the quarter turn nearest the current yaw.
+        """
+        current = p.getLinkState(self.robot, self.end_effector)[1]
+        yaw     = p.getEulerFromQuaternion(current)[2]
+        yaw     = round(yaw / (math.pi / 2)) * (math.pi / 2)
+        return p.getQuaternionFromEuler([math.pi, 0.0, yaw])
+
+    def _ik_with_orientation(self, point, orn):
+        """Joint-limit-aware IK for a full tool pose."""
+        if self._ik_limits is None:
+            lower, upper, ranges, movable = [], [], [], []
+            for j in range(p.getNumJoints(self.robot)):
+                info = p.getJointInfo(self.robot, j)
+                if info[2] == p.JOINT_FIXED:
+                    continue
+                movable.append(j)
+                lower.append(info[8])
+                upper.append(info[9])
+                ranges.append(info[9] - info[8])
+            self._ik_limits = (lower, upper, ranges, movable)
+        lower, upper, ranges, movable = self._ik_limits
+        rest = [p.getJointState(self.robot, j)[0] for j in movable]
+        return p.calculateInverseKinematics(
+            self.robot, self.end_effector, point, orn,
+            lowerLimits=lower, upperLimits=upper,
+            jointRanges=ranges, restPoses=rest,
+            maxNumIterations=200, residualThreshold=0.0005
+        )
+
+    def _direct_move(self, x, y, z, speed_factor=1.0, orn=None):
         target       = np.array([x, y, z])
         current      = np.array(self.get_end_effector_position())
         n            = self.rrt.trajectory_points
@@ -399,10 +444,15 @@ class FrankaPandaRobot:
         for i in range(n + 1):
             t     = i / n
             point = current + t * (target - current)
-            joint_angles = p.calculateInverseKinematics(
-                self.robot, self.end_effector, point,
-                maxNumIterations=100, residualThreshold=0.001
-            )
+            if orn is None:
+                joint_angles = p.calculateInverseKinematics(
+                    self.robot, self.end_effector, point,
+                    maxNumIterations=100, residualThreshold=0.001
+                )
+            else:
+                # Tool orientation held: used for every vertical
+                # approach so the gripper meets the part square.
+                joint_angles = self._ik_with_orientation(point, orn)
             for j, joint_idx in enumerate(self.arm_joints):
                 p.setJointMotorControl2(
                     self.robot, joint_idx,
@@ -499,14 +549,16 @@ class FrankaPandaRobot:
 
     def _descend_until_contact(self, x, y, start_z,
                                 torque_threshold=8.0,
-                                step_size=0.004):
+                                step_size=0.004, floor_z=None):
         """
         Descend until torque CHANGE spikes = contact detected.
         Uses relative threshold not absolute - works regardless
         of arm configuration and gravity compensation.
         """
         current_z    = start_z
-        min_z        = 0.08
+        # Never go lower than the known grasp height when one is
+        # given: contact sensing is the guard, not the target.
+        min_z        = 0.08 if floor_z is None else max(0.08, floor_z)
         readings     = []
 
         print(f"  [DESCENT] From z={start_z:.3f}m seeking contact...")
@@ -518,7 +570,51 @@ class FrankaPandaRobot:
 
         # Fast approach to just above expected contact
         approach_z = max(min_z + 0.10, start_z - 0.30)
-        self._direct_move(x, y, approach_z, speed_factor=0.15)
+        orn = self._down_orientation()
+        self._tool_orn = orn
+        self._direct_move(x, y, approach_z, speed_factor=0.15, orn=orn)
+
+        # Closed-loop x/y hold. Position control leaves a residual
+        # error that changes with height; left alone it reaches
+        # centimetres near the base. Measure it and command against it.
+        off_x = off_y = 0.0
+
+        def hold_xy(gain):
+            nonlocal off_x, off_y
+            ee = self.get_end_effector_position()
+            off_x = float(np.clip(off_x + gain * (x - ee[0]), -0.06, 0.06))
+            off_y = float(np.clip(off_y + gain * (y - ee[1]), -0.06, 0.06))
+
+        for _ in range(3):
+            hold_xy(1.0)
+            self._direct_move(x + off_x, y + off_y, approach_z,
+                              speed_factor=0.15, orn=orn)
+
+        # A vertical tool is not reachable everywhere (far slots,
+        # parts close to the base). If the arm cannot hold position
+        # with it, give up the orientation, not the position.
+        ee = self.get_end_effector_position()
+        # Give the arm time to settle on the pose before deciding
+        # it cannot hold a vertical tool there. A part gripped with
+        # a tilted tool is tilted when it is put down.
+        for _ in range(5):
+            if math.hypot(x - ee[0], y - ee[1]) <= 0.002:
+                break
+            hold_xy(1.0)
+            self._direct_move(x + off_x, y + off_y, approach_z,
+                              speed_factor=0.15, orn=orn)
+            ee = self.get_end_effector_position()
+
+        if math.hypot(x - ee[0], y - ee[1]) > 0.008:
+            print(f"  [DESCENT] Vertical tool not reachable here — "
+                  f"position-only approach")
+            orn = None
+            self._tool_orn = None
+            off_x = off_y = 0.0
+            for _ in range(3):
+                hold_xy(1.0)
+                self._direct_move(x + off_x, y + off_y, approach_z,
+                                  speed_factor=0.15)
 
         # Re-sample baseline after approach
         baseline = sum(abs(p.getJointState(self.robot, j)[3])
@@ -528,8 +624,31 @@ class FrankaPandaRobot:
         current_z = approach_z
         frame_count = 0
         while current_z > min_z:
-            current_z -= step_size
-            self._direct_move(x, y, current_z, speed_factor=0.02)
+            current_z = max(min_z, current_z - step_size)
+            hold_xy(0.5)
+            self._direct_move(x + off_x, y + off_y, current_z,
+                              speed_factor=0.02, orn=orn)
+
+            # Drifting sideways on the way down: stop descending and
+            # recover position first, without the orientation if the
+            # arm cannot hold both.
+            ee = self.get_end_effector_position()
+            if math.hypot(x - ee[0], y - ee[1]) > 0.008:
+                for attempt in range(4):
+                    if attempt == 2:
+                        orn = None
+                        self._tool_orn = None
+                        off_x = off_y = 0.0
+                    hold_xy(1.0)
+                    self._direct_move(x + off_x, y + off_y, current_z,
+                                      speed_factor=0.1, orn=orn)
+                    ee = self.get_end_effector_position()
+                    if math.hypot(x - ee[0], y - ee[1]) <= 0.005:
+                        break
+                readings.clear()
+                baseline = sum(abs(p.getJointState(self.robot, j)[3])
+                               for j in self.arm_joints)
+                continue
 
             # Save wrist view every 10 steps
             frame_count += 1
@@ -557,14 +676,19 @@ class FrankaPandaRobot:
         return current_z
 
     def _check_grasp_success(self, name, pre_z):
-        """Lift slightly and verify object came with gripper"""
+        """Lift slightly and confirm the part came up with the gripper."""
         ee = self.get_end_effector_position()
-        self._direct_move(ee[0], ee[1], ee[2]+0.05, speed_factor=0.1)
+        self._direct_move(ee[0], ee[1], ee[2]+0.05, speed_factor=0.1,
+                          orn=self._tool_orn)
         for _ in range(40):
             p.stepSimulation()
             time.sleep(self.sim_config["timestep"])
+        ee_rise = self.get_end_effector_position()[2] - ee[2]
         obj = self.get_object_position(name)
-        if obj and obj[2] > pre_z + 0.02:
+        part_rise = (obj[2] - pre_z) if obj else 0.0
+        # Judge the part against how far the gripper actually rose,
+        # not against the commanded lift.
+        if ee_rise > 0.01 and part_rise > 0.6 * ee_rise:
             print(f"  [GRASP] Object lifted z={obj[2]:.3f}m")
             return True
         print(f"  [GRASP] Object did not lift - grasp failed")
@@ -578,6 +702,13 @@ class FrankaPandaRobot:
                 "status": "failed", "action": "pick",
                 "target": name,
                 "detail": f"object '{name}' not found in scene"
+            }
+
+        if self.grasped_object:
+            return {
+                "status": "failed", "action": "pick", "target": name,
+                "detail": f"gripper is not empty "
+                          f"(holding '{self.grasped_object}')"
             }
 
         self.logger.info(f"Picking '{name}' at {pos}")
@@ -603,6 +734,18 @@ class FrankaPandaRobot:
         print(f"  [PICK] Above target - visual servoing...")
         aligned_x, aligned_y = self.servo.servo_to_object(self, name)
 
+        # If servoing gave up (part outside the camera's reliable
+        # range), the gripper may still be centimetres off. Descend
+        # on the part's reported position rather than wherever the
+        # arm happens to be.
+        if math.hypot(aligned_x - pos[0], aligned_y - pos[1]) > 0.01:
+            print(f"  [PICK] Servo did not align — "
+                  f"using reported part position")
+            aligned_x, aligned_y = pos[0], pos[1]
+            self._direct_move(aligned_x, aligned_y,
+                              self.get_end_effector_position()[2],
+                              speed_factor=0.3)
+
         # Physics-driven descent - no hardcoded height
         print(f"  [PICK] Descending to contact...")
         ee_now    = self.get_end_effector_position()
@@ -610,7 +753,9 @@ class FrankaPandaRobot:
             aligned_x, aligned_y,
             start_z          = ee_now[2],
             torque_threshold = 8.0,
-            step_size        = 0.004
+            step_size        = 0.004,
+            floor_z          = pos[2] - self.objects[name].get(
+                "grasp_depth", self.GRASP_DEPTH)
         )
 
         # Force-controlled grip
@@ -620,23 +765,51 @@ class FrankaPandaRobot:
             p.stepSimulation()
             time.sleep(self.sim_config["timestep"])
 
-        # Attach with actual offset - no teleport
+        # Attach the part exactly where it sits in the gripper.
+        # The constraint frame on the part is the gripper link pose
+        # expressed in the part's own frame, so the part keeps its
+        # grasp-time position and orientation and is not pulled
+        # sideways or twisted when the constraint engages.
         obj_id   = self.objects[name]["id"]
         obj_pos2 = self.get_object_position(name)
-        ee_pos2  = self.get_end_effector_position()
-        offset   = [obj_pos2[0]-ee_pos2[0],
-                    obj_pos2[1]-ee_pos2[1],
-                    obj_pos2[2]-ee_pos2[2]]
+
+        # A grasp only counts if the part is between the fingers.
+        ee_pos2 = self.get_end_effector_position()
+        miss = math.hypot(obj_pos2[0] - ee_pos2[0],
+                          obj_pos2[1] - ee_pos2[1])
+        if abs(obj_pos2[2] - ee_pos2[2]) > self.GRASP_CAPTURE_HEIGHT:
+            miss = max(miss, abs(obj_pos2[2] - ee_pos2[2]))
+        if miss > self.GRASP_CAPTURE_RADIUS:
+            print(f"  [PICK] ❌ Part is {miss*100:.1f}cm from the gripper "
+                  f"centre — not gripped")
+            self.open_gripper()
+            self._direct_move(ee_pos2[0], ee_pos2[1], ee_pos2[2] + 0.25,
+                              speed_factor=0.3)
+            self._sync_obstacles()
+            return {
+                "status": "failed", "action": "pick", "target": name,
+                "detail": f"grasp failed - '{name}' is {miss*100:.1f}cm "
+                          f"from the gripper centre"
+            }
+
+        link     = p.getLinkState(self.robot, self.end_effector)
+        part_pos, part_orn = p.getBasePositionAndOrientation(obj_id)
+        inv_pos, inv_orn   = p.invertTransform(part_pos, part_orn)
+        child_pos, child_orn = p.multiplyTransforms(
+            inv_pos, inv_orn, link[0], link[1]
+        )
 
         self.grasp_constraint = p.createConstraint(
-            parentBodyUniqueId  = self.robot,
-            parentLinkIndex     = self.end_effector,
-            childBodyUniqueId   = obj_id,
-            childLinkIndex      = -1,
-            jointType           = p.JOINT_FIXED,
-            jointAxis           = [0, 0, 0],
-            parentFramePosition = [0, 0, 0],
-            childFramePosition  = offset
+            parentBodyUniqueId     = self.robot,
+            parentLinkIndex        = self.end_effector,
+            childBodyUniqueId      = obj_id,
+            childLinkIndex         = -1,
+            jointType              = p.JOINT_FIXED,
+            jointAxis              = [0, 0, 0],
+            parentFramePosition    = [0, 0, 0],
+            childFramePosition     = child_pos,
+            parentFrameOrientation = [0, 0, 0, 1],
+            childFrameOrientation  = child_orn
         )
         p.changeConstraint(self.grasp_constraint, maxForce=50)
         self.grasped_object         = name
@@ -658,7 +831,8 @@ class FrankaPandaRobot:
             }
 
         print(f"  [PICK] Lifting '{name}'...")
-        self._direct_move(pos[0], pos[1], pos[2]+0.15, speed_factor=0.08)
+        self._direct_move(pos[0], pos[1], pos[2]+0.15, speed_factor=0.08,
+                          orn=self._tool_orn)
         self._direct_move(pos[0], pos[1], pos[2]+0.40, speed_factor=0.3)
         self._sync_obstacles()
 
@@ -682,6 +856,31 @@ class FrankaPandaRobot:
             "detail": (f"picked {name} from "
                        f"({pos[0]:.2f},{pos[1]:.2f},{pos[2]:.2f})")
         }
+
+    def insert_part(self, name, pocket, on_step=None):
+        """Seat the held part in a pocket by force-guided insertion."""
+        from motion.insertion import ForceGuidedInsertion
+        if self._insertion is None:
+            self._insertion = ForceGuidedInsertion(self)
+        result = self._insertion.insert(name, pocket,
+                                        on_step=on_step or self.on_force,
+                                        use_force=self.use_force_sensing)
+        self._sync_obstacles()
+        return result
+
+    def _retreat_straight_up(self, orn, clear_z=0.45):
+        """Leave a placed part without dragging it sideways."""
+        ee_up = self.get_end_effector_position()
+        off_x = off_y = 0.0
+        for i in range(1, 8):
+            self._direct_move(ee_up[0] + off_x, ee_up[1] + off_y,
+                              ee_up[2] + 0.01 * i,
+                              speed_factor=0.08, orn=orn)
+            now = self.get_end_effector_position()
+            off_x += 0.5 * (ee_up[0] - now[0])
+            off_y += 0.5 * (ee_up[1] - now[1])
+        self._direct_move(ee_up[0], ee_up[1], clear_z, speed_factor=0.4,
+                          orn=orn)
 
     def place_object(self, x, y, stack_on=None):
         if not self.grasped_object:
@@ -744,12 +943,37 @@ class FrankaPandaRobot:
 
         # Physics-driven descent - feel the surface
         ee_now = self.get_end_effector_position()
-        self._descend_until_contact(
-            x, y,
-            start_z=ee_now[2],
-            torque_threshold=6.0,
-            step_size=0.003
-        )
+        if stack_on and stack_pos:
+            # Stacking leaves no room for error: square the tool,
+            # measure where the part sits in the gripper, aim the
+            # part (not the gripper) at the base, and stop just above
+            # the base instead of pressing down until something gives.
+            orn = self._down_orientation()
+            for _ in range(3):
+                self._direct_move(x, y, ee_now[2], speed_factor=0.15,
+                                  orn=orn)
+            ee_now  = self.get_end_effector_position()
+            held    = self.get_object_position(placed)
+            base_h  = self.objects[stack_on].get("half_extent", 0.025)
+            part_h  = self.objects[placed].get("half_extent", 0.025)
+            aim_x   = x - (held[0] - ee_now[0])
+            aim_y   = y - (held[1] - ee_now[1])
+            floor_z = (stack_pos[2] + base_h + part_h
+                       + (ee_now[2] - held[2]) + 0.002)
+            self._descend_until_contact(
+                aim_x, aim_y,
+                start_z=ee_now[2],
+                torque_threshold=6.0,
+                step_size=0.003,
+                floor_z=floor_z
+            )
+        else:
+            self._descend_until_contact(
+                x, y,
+                start_z=ee_now[2],
+                torque_threshold=6.0,
+                step_size=0.003
+            )
 
         # Settle on surface
         for _ in range(60):
@@ -779,11 +1003,44 @@ class FrankaPandaRobot:
             time.sleep(self.sim_config["timestep"])
 
         # Rise away cleanly - straight up first, then move
-        self._direct_move(x, y, 0.45, speed_factor=0.6)
+        released = self.get_object_position(placed)
+        if stack_on:
+            # Straight up and slowly at first: any sideways motion
+            # here drags the part off the one below it.
+            self._retreat_straight_up(self._tool_orn)
+        else:
+            self._direct_move(x, y, 0.45, speed_factor=0.6,
+                              orn=self._tool_orn)
+
+        # Release confirmation: the part must stay where it was put
+        # down, not come back up with the gripper.
+        final = self.get_object_position(placed)
+        if released and final and final[2] > released[2] + 0.05:
+            print(f"  [PLACE] ⚠️  '{placed}' came up with the gripper "
+                  f"— setting it down again")
+            ee = self.get_end_effector_position()
+            self._direct_move(ee[0], ee[1],
+                              ee[2] - (final[2] - released[2]) + 0.005,
+                              speed_factor=0.1, orn=self._tool_orn)
+            self.open_gripper()
+            for _ in range(120):
+                p.stepSimulation()
+                time.sleep(self.sim_config["timestep"])
+            self._direct_move(x, y, 0.45, speed_factor=0.1,
+                              orn=self._tool_orn)
+            final = self.get_object_position(placed)
+            if final and final[2] > released[2] + 0.05:
+                self.grasped_object = placed
+                self._sync_obstacles()
+                return {
+                    "status": "failed", "action": "place",
+                    "target": placed,
+                    "detail": f"'{placed}' did not release from the "
+                              f"gripper — human intervention required"
+                }
         self._sync_obstacles()
 
         # Verify
-        final = self.get_object_position(placed)
         if final:
             drift = math.sqrt(
                 (final[0]-x)**2 + (final[1]-y)**2
