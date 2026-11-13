@@ -93,6 +93,10 @@ def main():
                     choices=["none", "guard", "estop", "plc"])
     ap.add_argument("--jobs", type=int, default=2)
     ap.add_argument("--gui", action="store_true")
+    ap.add_argument("--scene", default="dispatch",
+                    choices=["dispatch", "assembly"],
+                    help="assembly: housing with pockets, recipe 3, "
+                         "force-guided insertion (one job)")
     ap.add_argument("--verbose", action="store_true",
                     help="show the robot's own motion log")
     ap.add_argument("--audit", default="audit_logs/cell.jsonl")
@@ -107,7 +111,14 @@ def main():
         os.remove(args.audit)
     with contextlib.redirect_stdout(io.StringIO() if quiet
                                     else sys.__stdout__):
-        cell = build_sim_cell(logger, gui=args.gui, audit_path=args.audit)
+        if args.scene == "assembly":
+            cell = build_sim_cell(logger, gui=args.gui, audit_path=args.audit,
+                                  scene="assembly",
+                                  housing_offset=(0.002, -0.0015))
+        else:
+            cell = build_sim_cell(logger, gui=args.gui, audit_path=args.audit)
+    recipe = 3 if args.scene == "assembly" else 1
+    jobs = 1 if args.scene == "assembly" else args.jobs
     install_hazard(cell, args.scenario)
 
     say("=" * 100)
@@ -117,10 +128,10 @@ def main():
     show(cell, "cell started")
 
     job_id = 1000
-    for n in range(args.jobs):
+    for n in range(jobs):
         job_id += 1
-        say(f"\n  PLC: JOB_START job={job_id} recipe=1")
-        state = run_job(cell, job_id, 1)
+        say(f"\n  PLC: JOB_START job={job_id} recipe={recipe}")
+        state = run_job(cell, job_id, recipe)
         show(cell, f"job {job_id} finished")
 
         if state is CellState.FAULT:
@@ -147,6 +158,7 @@ def main():
             show(cell, "PLC acknowledged")
 
         with contextlib.redirect_stdout(io.StringIO()):
+            if args.scene != "assembly":
             refill_infeed(cell.robot)
         poll(cell)
 

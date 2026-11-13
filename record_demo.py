@@ -125,6 +125,7 @@ class Hud:
         self.sim_time = 0.0
         self.measured = True
         self.free_text = False           # order typed, not a PLC job
+        self.speed = SPEED
         self.force = None                # live contact force (N), assembly
         self.force_trace = []
         self.result_label = "Last placement"
@@ -316,7 +317,7 @@ class Hud:
                 y += 21
 
         d.text((x0, H - 30), self.footer, font=F_SMALL, fill=MUTED)
-        d.text((16, H - 30), f"Simulation  ·  {SPEED:.0f}x speed  ·  "
+        d.text((16, H - 30), f"Simulation  ·  {self.speed:.0f}x speed  ·  "
                f"t = {self.sim_time:5.1f} s", font=F_SMALL, fill=(70, 76, 86))
         return img
 
@@ -360,6 +361,7 @@ class Recorder:
         self.proj = p.computeProjectionMatrixFOV(42, SCENE_W / H, 0.05, 6)
         self.camera()
         self.hud = None
+        self.steps_per_frame = STEPS_PER_FRAME
         self.steps = 0
         self.frames = 0
         self.last = None
@@ -376,7 +378,7 @@ class Recorder:
         self.steps += 1
         if self.hud is not None:
             self.hud.sim_time = self.steps / 240
-            if self.steps % STEPS_PER_FRAME == 0:
+            if self.steps % self.steps_per_frame == 0:
                 self.frame()
         return out
 
@@ -390,6 +392,7 @@ class Recorder:
                                lightDirection=[0.6, -0.5, 1.6])
         scene = Image.fromarray(
             np.reshape(raw[2], (H, SCENE_W, 4))[:, :, :3].astype("uint8"))
+        self.hud.speed = self.steps_per_frame / 240 * FPS
         self.last = self.hud.draw(scene)
         self._write(self.last)
 
@@ -468,9 +471,11 @@ def connect_assembly_view(cell, rec, hud):
         rec.camera(target=(pocket["x"], pocket["y"], 0.15), distance=0.62,
                    yaw=62, pitch=-24)
         hud.force_trace.clear()
+        rec.steps_per_frame = 2 * STEPS_PER_FRAME   # insertion is slow
         try:
             return original(name, pocket, *a, **k)
         finally:
+            rec.steps_per_frame = STEPS_PER_FRAME
             hud.force = 0.0
             rec.hold(1.2)
             rec.camera(**WIDE_ASSEMBLY)
@@ -743,9 +748,20 @@ def scenario_order(rec, text, scene="dispatch"):
     if not cfg.ANTHROPIC_API_KEY:
         sys.exit("ANTHROPIC_API_KEY is not set; this scenario needs the "
                  "language model")
-    hud = Hud("Free-text order", "The model requests actions; code decides and measures",
+    hud = Hud("Language-model order" if scene != "assembly"
+              else "Language-model assembly",
+              "The model plans the steps; code gates, measures and checks",
               f"Language model: {cfg.AI['model']}")
     off = (0.002, -0.0015) if scene == "assembly" else (0.0, 0.0)
+    words, lines = text.split(), [""]
+    for word in words:
+        if len(lines[-1]) + len(word) > 58:
+            lines.append("")
+        lines[-1] = (lines[-1] + " " + word).strip()
+    rec.card("The operator types an order",
+             ['"' + lines[0]] + lines[1:-1]
+             + ([lines[-1] + '"'] if len(lines) > 1 else [])
+             if len(lines) > 1 else ['"' + text + '"'], seconds=3.5)
     cell = make_cell(rec, hud, llm=True, scene=scene, housing_offset=off)
     if scene != "assembly":
         announce_retries(cell, hud)
