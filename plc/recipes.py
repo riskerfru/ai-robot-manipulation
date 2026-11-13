@@ -27,6 +27,14 @@ RECIPES = {
             {"action": "place_slot", "slot": 1},
         ],
     },
+    3: {
+        "name": "assemble unit: motor, bearing, sensor",
+        "subtasks": [
+            {"action": "insert", "object": "motor"},
+            {"action": "insert", "object": "bearing"},
+            {"action": "insert", "object": "sensor"},
+        ],
+    },
 }
 
 

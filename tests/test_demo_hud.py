@@ -62,3 +62,20 @@ def test_marks_do_not_depend_on_font_glyphs():
                for y in range(190, 300)}
     from record_demo import BLUE, GREEN, RED
     assert {GREEN, BLUE, RED} <= colours
+
+
+def test_insertion_results_reach_the_panel():
+    hud = Hud("t", "s", "f")
+    hud.force = 0.0
+    hud.on_audit("insertion", {"part": "motor", "result": {
+        "status": "success", "searched": True, "search_offset_mm": 2.0,
+        "peak_force_n": 37.0}})
+    assert "search 2 mm" in hud.measure[0] and "37 N" in hud.measure[0]
+    hud.on_audit("insertion", {"part": "bearing", "result": {
+        "status": "failed", "detail": "not seated"}})
+    assert "not seated" in hud.measure[0]
+    hud.on_audit("insertion", {"part": "sensor", "result": {
+        "status": "success", "unverified": True, "peak_force_n": 5.0}})
+    assert "not checked" in hud.measure[0]
+    hud.force_trace = [0.0, 5.0, 30.0]
+    assert hud.draw(Image.new("RGB", (SCENE_W, H))).size == (W, H)

@@ -38,6 +38,9 @@ You control a Franka Panda robot arm via these actions:
   stack(object, on)   - stack object on top of another
   scan()              - scan scene
   home()              - return to home
+  insert(object)      - assembly cells only: pick the component from its
+                        station and seat it in its housing pocket by
+                        force-guided insertion (one action does both)
 
 CONVEYOR SLOTS — DESTINATIONS ONLY, NEVER PICK FROM THESE:
 {_SLOT_PROMPT_LINES}
@@ -59,9 +62,9 @@ text (not as a tool call).
 RESPONSE FORMAT - always return valid JSON:
 {{
   "thinking": "one sentence about current situation",
-  "action": "pick" | "place_slot" | "place" | "stack" | "scan" | "home" | "done" | "failed",
+  "action": "pick" | "place_slot" | "place" | "stack" | "insert" | "scan" | "home" | "done" | "failed",
   "params": {{
-    "object": "red",    (for pick, stack)
+    "object": "red",    (for pick, stack, insert)
     "slot": 2,          (for place_slot)
     "on": "green",      (for stack - object to stack ON TOP OF)
     "x": 0.4,           (for place)
@@ -247,6 +250,7 @@ def decompose_order(order, client, model, known_objects=None):
         '{"action": "place_slot", "slot": 1}\n'
         '{"action": "place", "x": 0.4, "y": 0.1}\n'
         '{"action": "stack", "object": "blue", "on": "green"}\n'
+        '{"action": "insert", "object": "motor"}\n'
         '{"action": "scan"}\n'
         '{"action": "home"}\n\n'
         "CONVEYOR SLOTS:\n"
@@ -256,6 +260,9 @@ def decompose_order(order, client, model, known_objects=None):
         + obj_note + "\n\n"
         "Rules:\n"
         "- Pick before place or stack\n"
+        "- Assembly orders (seat/insert/assemble components into a "
+        "housing): use ONE insert subtask per component and no pick, "
+        "in the order the operator asks for\n"
         "- Each object to different slot (not all to slot 2)\n"
         "- NEVER invent objects not in the known list\n"
         "- Return ONLY the JSON array"
@@ -934,6 +941,46 @@ class WarehouseAgent:
                     "target": f"{obj} on {target}",
                     "detail": f"stacked {obj} on {target} ✅ verified"
                               if ok else "stack failed"
+                }
+
+            # ──────────────────────────────────────────
+            elif action == "insert":
+                obj = (params.get("object") or params.get("item")
+                       or current_subtask.get("object", ""))
+                pocket = getattr(self.robot, "pockets", {}).get(obj)
+                if not obj or pocket is None:
+                    return {"action": "insert", "status": "failed",
+                            "detail": f"no pocket defined for '{obj}'"}
+
+                if self.robot.grasped_object not in (None, obj):
+                    return {"action": "insert", "status": "failed",
+                            "detail": f"holding "
+                                      f"{self.robot.grasped_object}, not {obj}"}
+                if self.robot.grasped_object != obj:
+                    picked = self.robot.pick_object(obj)
+                    if not (isinstance(picked, dict)
+                            and picked.get("status") == "success"):
+                        return {"action": "insert", "status": "failed",
+                                "detail": (picked.get("detail")
+                                           if isinstance(picked, dict)
+                                           else f"could not pick {obj}")}
+
+                result = self.robot.insert_part(obj, pocket)
+                self.audit.log("insertion", part=obj, result=result)
+                print(f"  [INSERT] {result.get('detail')}")
+
+                if (result.get("status") != "success"
+                        and self.robot.grasped_object == obj):
+                    # Not seated and still in the gripper: put it back
+                    # on its station so a retry starts from a fresh grasp.
+                    station = getattr(self.robot, "stations", {}).get(obj)
+                    if station:
+                        self.robot.place_object(*station)
+                return {
+                    "action": "insert",
+                    "status": result.get("status", "failed"),
+                    "target": obj,
+                    "detail": result.get("detail", "insertion failed"),
                 }
 
             # ──────────────────────────────────────────

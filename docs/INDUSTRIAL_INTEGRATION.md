@@ -248,6 +248,13 @@ Two gaps on the hardware side:
    is not connected to the UR backend. The cell layout has to keep the
    approach corridors clear until it is.
 
+3. **Force-guided insertion is simulation only.** `motion/insertion.py`
+   reads the contact force on the held part from the physics engine and
+   steps the arm in position control. On a UR5e the same logic would read
+   the built-in tool force/torque sensor over RTDE and should use the
+   controller's force mode, which limits contact force far better than
+   small position steps do. The UR backend does not implement it.
+
 ## Before this runs on a real cell
 
 1. Run the UR backend against URSim and fix what that finds.

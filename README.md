@@ -79,11 +79,37 @@ git clone https://github.com/riskerfru/ai-robot-manipulation.git
 cd ai-robot-manipulation
 pip install -r requirements.txt
 
-python -m pytest -q                     # 79 tests, about 20 s
+python -m pytest -q                     # 86 tests, about 1 min
 python run_cell.py                      # two PLC jobs, headless, no API key
 python run_cell.py --scenario guard     # guard door opens mid-job
 python run_cell.py --gui                # watch it
 python eval_physics.py --orders 20      # the numbers above (about 35 min)
+```
+
+## Force-guided assembly
+
+A second cell layout (`scene="assembly"`): a housing with three pockets is
+fixed on the conveyor, and three supply stations each hold one component
+(50, 40 and 35 mm). Recipe 3 seats each component in its pocket, which
+leaves 1.5 mm per side.
+
+Position alone does not do this. The component's position in the gripper
+and the housing's position are each known only to a few millimetres, so
+the arm lowers the component until it feels contact, tells from its own
+height whether the part is in the pocket or on the rim, and if it is on the
+rim searches in a spiral under light contact until the part drops in
+(`motion/insertion.py`). A component that does not reach the pocket floor
+is reported as a failure and returned to its station.
+
+The force signal is the contact force between the held part and the
+housing, read from the physics engine. On hardware that is a wrist
+force/torque sensor (a UR5e has one built in). There is no screwing,
+press-fit or snap-fit here.
+
+```bash
+python record_demo.py assembly            # three components seated
+python record_demo.py assembly-compare    # position only, then force-guided
+python record_demo.py order --scene assembly --text "assemble the unit: seat the motor, then the bearing, then the sensor"   # needs the API key
 ```
 
 Demo videos with a live status panel (needs `ffmpeg`):
@@ -150,6 +176,7 @@ returns to READY after the guard is closed and the fault acknowledged.
 | Audit trail | `audit/` | Hash-chained JSON Lines; `python -m audit.trail <file>` verifies |
 | Robot backends | `hardware/` | PyBullet Panda; UR5e over RTDE (fake-tested only) |
 | Cell definition | `cell/` | Layout, scene builder, factory, visual dressing for recordings |
+| Assembly cell | `cell/assembly.py`, `motion/insertion.py` | Housing with pockets, supply stations, force-guided insertion |
 | Demo recorder | `record_demo.py` | Headless video with a status panel driven by the audit trail |
 
 Design reasoning: [DESIGN.md](DESIGN.md). Change history:

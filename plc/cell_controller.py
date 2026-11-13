@@ -103,7 +103,7 @@ class CellController:
         self.last_result = result
 
         placed = sum(1 for t in result.get("completed", [])
-                     if "place" in str(t))
+                     if "place" in str(t) or "insert" in str(t))
         failed = len(result.get("failed", []))
         self.bus.write("PARTS_OK", placed)
         self.bus.write("PARTS_FAILED", failed)

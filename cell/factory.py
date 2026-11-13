@@ -41,7 +41,8 @@ def default_limits():
 def build_sim_cell(logger, gui=False, seed=None, randomize=False,
                    audit_path=None, with_plc=True, llm_enabled=False,
                    limits=None, bus=None, verifier_kwargs=None,
-                   start_soft_plc=True):
+                   start_soft_plc=True, scene="dispatch",
+                   housing_offset=(0.0, 0.0)):
     """
     Build a complete simulated cell. Returns a namespace with:
       robot (raw backend), supervised, safety, audit, agent,
@@ -52,8 +53,23 @@ def build_sim_cell(logger, gui=False, seed=None, randomize=False,
 
     rng = random.Random(seed)
     robot = make_sim_robot(logger, gui=gui)
-    positions = sample_part_positions(rng) if randomize else None
-    build_cell(robot, part_positions=positions, gui=gui)
+    if scene == "assembly":
+        # Housing with pockets and three supply stations. The housing
+        # may sit a few millimetres off nominal (housing_offset); the
+        # controller is only told the nominal pockets.
+        from cell import assembly as A
+        positions = {}
+        build_cell(robot, part_positions={}, gui=gui)
+        A.add_housing((A.HOUSING_CENTRE[0] + housing_offset[0],
+                       A.HOUSING_CENTRE[1] + housing_offset[1]))
+        A.add_components(robot)
+        robot.pockets = {n: A.pocket_for(n) for n in A.COMPONENTS}
+        robot.stations = {n: c["station"] for n, c in A.COMPONENTS.items()}
+        for _ in range(100):
+            robot.step()
+    else:
+        positions = sample_part_positions(rng) if randomize else None
+        build_cell(robot, part_positions=positions, gui=gui)
 
     audit = AuditTrail(audit_path)
 

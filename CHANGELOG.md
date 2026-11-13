@@ -27,6 +27,9 @@ What was tried, what the evidence was, and what was kept.
 | Placement tolerance tightened from 8 cm to 2 cm, set in `config.PLACEMENT` | 8 cm was hiding the placement error above | `config.py` |
 | Slot calibration measures against the commanded position, is applied on the first place, and ignores scattered errors | A corrected placement that landed on target was diluting the learned offset; random knocks were being learned as offsets | `tests/test_verifier_honesty.py` |
 | Stored `slot_calibration.json` removed from the repository | It held a 5 cm offset learned from stub runs and was loaded on every start | `.gitignore` |
+| Force-guided assembly: three components seated in housing pockets with 1.5 mm clearance | Stacking blocks is not an assembly; fit-up needs force sensing because position is only known to a few millimetres | `motion/insertion.py`, `cell/assembly.py`, `tests/test_assembly.py` |
+| Stacking releases at a known height and retreats straight up | The descent pushed the lower part away and the retreat dragged the upper one; stacking is still not reliable and has no check of its own | `core/robot.py` |
+| Pick descent stops exactly at the grasp height | It could overshoot by up to one 4 mm step | same |
 | Demo recorder with a status panel drawn from the audit trail | The old video showed coloured cubes and a terminal; nothing showed what the controller knew or decided | `record_demo.py`, `tests/test_demo_hud.py` |
 | Physics evaluation with repeated randomised trials | The 12-case check uses a stub robot that lands every retry perfectly | `eval_physics.py`, `EVAL.md` |
 

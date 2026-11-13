@@ -11,6 +11,11 @@
 #   python record_demo.py guard       guard door opens mid-job
 #   python record_demo.py verify      the same knocked part, without
 #                                     and with placement measurement
+#   python record_demo.py assembly    three components seated in a housing
+#                                     by force-guided insertion
+#   python record_demo.py assembly-compare
+#                                     the same assembly, position only
+#                                     and then force-guided
 #   python record_demo.py order --text "dispatch all blocks to the conveyor"
 #                                     free-text order through the language
 #                                     model (needs ANTHROPIC_API_KEY)
@@ -96,6 +101,8 @@ def describe(subtask):
         return f"Place in slot {subtask.get('slot')}"
     if action == "place":
         return f"Place at ({subtask.get('x')}, {subtask.get('y')})"
+    if action == "insert":
+        return f"Seat {subtask.get('object')} in its pocket"
     if action == "stack":
         return f"Stack {subtask.get('object')} on {subtask.get('on')}"
     return str(action).capitalize()
@@ -118,6 +125,9 @@ class Hud:
         self.sim_time = 0.0
         self.measured = True
         self.free_text = False           # order typed, not a PLC job
+        self.force = None                # live contact force (N), assembly
+        self.force_trace = []
+        self.result_label = "Last placement"
 
     def event(self, text, colour=TEXT):
         self.events.append((self.sim_time, text, colour))
@@ -176,6 +186,23 @@ class Hud:
             else:
                 self.measure = (f"{part}: {r['detail'][:46]}", RED)
                 self.event(f"Measured {part}: FAILED", RED)
+        elif name == "insertion":
+            r = d["result"]
+            part = d["part"]
+            if r.get("unverified"):
+                self.measure = (f"{part}: released at nominal, not checked",
+                                AMBER)
+                self.event(f"{part}: released, not checked", AMBER)
+            elif r["status"] == "success":
+                how = (f"search {r['search_offset_mm']:.0f} mm, "
+                       if r.get("searched") else "")
+                self.measure = (f"{part} seated: {how}"
+                                f"peak {r['peak_force_n']:.0f} N", GREEN)
+                self.event(f"Seated {part}: {how}peak "
+                           f"{r['peak_force_n']:.0f} N", GREEN)
+            else:
+                self.measure = (f"{part}: not seated", RED)
+                self.event(f"{part}: NOT seated, reported as failure", RED)
         elif name == "job_done":
             self.event(f"PLC: DONE, {d['parts_ok']} parts reported placed", GREEN)
         elif name == "job_fault":
@@ -243,16 +270,42 @@ class Hud:
                font=F_SMALL, fill=MUTED if self.guard_closed else RED)
         y += 28
 
-        label("Last placement")
-        d.text((x0, y), self.measure[0], font=F_BODY, fill=self.measure[1])
+        if self.force is not None:
+            label("Contact force on the part")
+            bar_w = x1 - x0 - 70
+            level = min(1.0, self.force / 60.0)
+            colour = (GREEN if self.force < 2 else AMBER
+                      if self.force < 40 else RED)
+            d.rounded_rectangle([x0, y + 2, x0 + bar_w, y + 16], radius=7,
+                                fill=CARD)
+            if level > 0:
+                d.rounded_rectangle([x0, y + 2,
+                                     x0 + max(14, int(bar_w * level)), y + 16],
+                                    radius=7, fill=colour)
+            d.text((x0 + bar_w + 10, y - 1), f"{self.force:4.0f} N",
+                   font=F_BOLD, fill=TEXT)
+            y += 24
+            trace = self.force_trace[-120:]
+            if len(trace) > 1:
+                h = 34
+                pts = [(x0 + i * (x1 - x0) / 119,
+                        y + h - min(1.0, f / 60.0) * h)
+                       for i, f in enumerate(trace)]
+                d.line(pts, fill=BLUE, width=2)
+            d.line([(x0, y + 34), (x1, y + 34)], fill=LINE, width=1)
+            y += 44
+
+        label(self.result_label)
+        d.text((x0, y), self.measure[0][:52], font=F_BODY, fill=self.measure[1])
         y += 32
 
         if self.truth is not None:
             label("True position (simulator)")
             for part, drift, ok in self.truth:
                 self._mark(d, x0, y, "done" if ok else "failed")
-                d.text((x0 + 24, y - 2),
-                       f"{part}: {drift:.1f} cm from slot centre",
+                text = (drift if isinstance(drift, str)
+                        else f"{drift:.1f} cm from slot centre")
+                d.text((x0 + 24, y - 2), f"{part}: {text}",
                        font=F_BODY, fill=TEXT if ok else RED)
                 y += 22
         else:
@@ -304,15 +357,19 @@ class Recorder:
              "-i", "-", "-c:v", "libx264", "-pix_fmt", "yuv420p",
              "-crf", "20", "-movflags", "+faststart", path],
             stdin=subprocess.PIPE)
-        self.view = p.computeViewMatrixFromYawPitchRoll(
-            [0.36, 0.0, 0.26], 2.05, 38, -36, 0, 2)
-        self.proj = p.computeProjectionMatrixFOV(42, SCENE_W / H, 0.1, 6)
+        self.proj = p.computeProjectionMatrixFOV(42, SCENE_W / H, 0.05, 6)
+        self.camera()
         self.hud = None
         self.steps = 0
         self.frames = 0
         self.last = None
         self._orig_step = p.stepSimulation
         p.stepSimulation = self._step
+
+    def camera(self, target=(0.36, 0.0, 0.26), distance=2.05, yaw=38,
+               pitch=-36):
+        self.view = p.computeViewMatrixFromYawPitchRoll(
+            list(target), distance, yaw, pitch, 0, 2)
 
     def _step(self, *a, **k):
         out = self._orig_step(*a, **k)
@@ -363,11 +420,16 @@ class Recorder:
 
 # ---- cell set-up ---------------------------------------------
 
-def make_cell(rec, hud, llm=False):
+def make_cell(rec, hud, llm=False, scene="dispatch",
+              housing_offset=(0.0, 0.0)):
     """Build a cell and connect it to the recorder and the panel."""
     with contextlib.redirect_stdout(io.StringIO()):
-        cell = build_sim_cell(NullLogger(), llm_enabled=llm)
+        cell = build_sim_cell(NullLogger(), llm_enabled=llm, scene=scene,
+                              housing_offset=housing_offset)
     cell.dressing = CellDressing(cell.robot)
+    cell.housing_offset = housing_offset
+    if scene == "assembly":
+        connect_assembly_view(cell, rec, hud)
     original_log = cell.audit.log
 
     def log(event, **payload):
@@ -381,6 +443,56 @@ def make_cell(rec, hud, llm=False):
     cell.audit.log = log
     rec.hud = hud
     return cell
+
+
+WIDE_ASSEMBLY = dict(target=(0.47, 0.0, 0.20), distance=1.6, yaw=38,
+                     pitch=-38)
+
+
+def connect_assembly_view(cell, rec, hud):
+    """Force read-out on the panel and a close-up during each insertion."""
+    hud.force = 0.0
+    hud.result_label = "Last insertion"
+    hud.measure = ("No insertion yet", MUTED)
+    rec.camera(**WIDE_ASSEMBLY)
+    backend = cell.robot
+
+    def on_force(z, force):
+        hud.force = max(0.0, force)
+        hud.force_trace.append(hud.force)
+
+    backend.on_force = on_force
+    original = backend.insert_part
+
+    def insert_part(name, pocket, *a, **k):
+        rec.camera(target=(pocket["x"], pocket["y"], 0.15), distance=0.62,
+                   yaw=62, pitch=-24)
+        hud.force_trace.clear()
+        try:
+            return original(name, pocket, *a, **k)
+        finally:
+            hud.force = 0.0
+            rec.hold(1.2)
+            rec.camera(**WIDE_ASSEMBLY)
+
+    backend.insert_part = insert_part
+
+
+def show_assembly_truth(cell, hud):
+    """Is each component really seated? From the simulator's ground truth."""
+    from cell import assembly as A
+    off = cell.housing_offset
+    centre = (A.HOUSING_CENTRE[0] + off[0], A.HOUSING_CENTRE[1] + off[1])
+    truth = []
+    for name in A.COMPONENTS:
+        pocket = A.pocket_for(name, centre)
+        pos = cell.robot.get_object_position(name)
+        gap = 1000 * (pos[2] - pocket["half"] - pocket["floor_z"])
+        side = 1000 * math.hypot(pos[0] - pocket["x"], pos[1] - pocket["y"])
+        seated = abs(gap) <= 2.0 and side <= 1000 * pocket["clearance"] + 1.0
+        truth.append((name, "seated in its pocket" if seated else
+                      f"NOT seated, {gap:.0f} mm above the floor", seated))
+    hud.truth = truth
 
 
 def quiet(fn, *a, **k):
@@ -577,24 +689,83 @@ def scenario_verify(rec):
     cell.soft_plc.stop()
 
 
-def scenario_order(rec, text):
+def scenario_assembly(rec, offset_mm=(2.0, -1.5)):
+    off = (offset_mm[0] / 1000, offset_mm[1] / 1000)
+    hud = Hud("Force-guided assembly",
+              "Three components seated in pockets with 1.5 mm clearance",
+              "Recipe mode: no language model in this run")
+    cell = make_cell(rec, hud, scene="assembly", housing_offset=off)
+    quiet(cell.controller.poll)
+    rec.hold(1.5)
+    run_job(cell, 3001, recipe=3)
+    show_assembly_truth(cell, hud)
+    rec.hold(5.0)
+    cell.soft_plc.stop()
+
+
+def scenario_assembly_compare(rec, offset_mm=(3.0, 2.5)):
+    off = (offset_mm[0] / 1000, offset_mm[1] / 1000)
+    shift = math.hypot(*offset_mm)
+
+    rec.card("Position only",
+             [f"The housing sits {shift:.0f} mm from where the robot expects it.",
+              "The pockets leave 1.5 mm per side.",
+              "The robot goes to the taught position and lets go."])
+    hud = Hud("Position only", "Taught positions, no force sensing, no check",
+              "Recipe mode: no language model in this run")
+    cell = make_cell(rec, hud, scene="assembly", housing_offset=off)
+    cell.robot.use_force_sensing = False
+    quiet(cell.controller.poll)
+    rec.hold(1.0)
+    run_job(cell, 3101, recipe=3)
+    show_assembly_truth(cell, hud)
+    rec.hold(5.0)
+    cell.soft_plc.stop()
+    rec.hud = None
+    p.disconnect()
+
+    rec.card("Force-guided",
+             ["The same housing, the same 4 mm error.",
+              "The robot feels the rim, searches, and seats each part.",
+              "A part that does not seat is reported as a failure."])
+    hud = Hud("Force-guided", "Feel the contact, search, seat, then check",
+              "Recipe mode: no language model in this run")
+    cell = make_cell(rec, hud, scene="assembly", housing_offset=off)
+    quiet(cell.controller.poll)
+    rec.hold(1.0)
+    run_job(cell, 3102, recipe=3)
+    show_assembly_truth(cell, hud)
+    rec.hold(5.0)
+    cell.soft_plc.stop()
+
+
+def scenario_order(rec, text, scene="dispatch"):
     if not cfg.ANTHROPIC_API_KEY:
         sys.exit("ANTHROPIC_API_KEY is not set; this scenario needs the "
                  "language model")
     hud = Hud("Free-text order", "The model requests actions; code decides and measures",
               f"Language model: {cfg.AI['model']}")
-    cell = make_cell(rec, hud, llm=True)
-    announce_retries(cell, hud)
+    off = (0.002, -0.0015) if scene == "assembly" else (0.0, 0.0)
+    cell = make_cell(rec, hud, llm=True, scene=scene, housing_offset=off)
+    if scene != "assembly":
+        announce_retries(cell, hud)
     rec.hold(1.5)
     quiet(cell.agent.run, text)
-    show_truth_from_slots(cell, hud)
+    if scene == "assembly":
+        show_assembly_truth(cell, hud)
+    else:
+        show_truth_from_slots(cell, hud)
     rec.hold(5.0)
     cell.soft_plc.stop()
 
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("scenario", choices=["normal", "guard", "verify", "order"])
+    ap.add_argument("scenario", choices=["normal", "guard", "verify", "order",
+                                         "assembly", "assembly-compare"])
+    ap.add_argument("--scene", default="dispatch",
+                    choices=["dispatch", "assembly"],
+                    help="cell used by the 'order' scenario")
     ap.add_argument("--text", default="dispatch all blocks to the conveyor")
     ap.add_argument("--out", default=None)
     args = ap.parse_args()
@@ -608,8 +779,12 @@ def main():
             scenario_guard(rec)
         elif args.scenario == "verify":
             scenario_verify(rec)
+        elif args.scenario == "assembly":
+            scenario_assembly(rec)
+        elif args.scenario == "assembly-compare":
+            scenario_assembly_compare(rec)
         else:
-            scenario_order(rec, args.text)
+            scenario_order(rec, args.text, args.scene)
     finally:
         rec.close()
 

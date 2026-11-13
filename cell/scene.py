@@ -30,7 +30,8 @@ def build_cell(robot, part_positions=None, gui=False, settle_steps=100):
     """
     Create table, conveyor, slot markers and parts.
 
-    part_positions: {name: (x, y)} or None for the nominal nests.
+    part_positions: {name: (x, y)}, None for the nominal nests, or {}
+    for a cell with no dispatch parts (the assembly cell).
     Returns the slot dictionary that was installed on the robot.
     """
     hx, hy, hz = L.TABLE_HALF
@@ -42,7 +43,7 @@ def build_cell(robot, part_positions=None, gui=False, settle_steps=100):
         baseVisualShapeIndex=table_vis,
         basePosition=[L.TABLE_CENTRE[0], L.TABLE_CENTRE[1], hz])
 
-    positions = part_positions or L.PART_NESTS
+    positions = L.PART_NESTS if part_positions is None else part_positions
     for name, (x, y) in positions.items():
         robot.add_object(name, x=x, y=y,
                          color=L.PART_COLOURS[name], z=L.PART_Z)

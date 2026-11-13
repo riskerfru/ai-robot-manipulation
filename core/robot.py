@@ -35,6 +35,11 @@ class FrankaPandaRobot:
         self.config        = config
         self._tool_orn     = None
         self._ik_limits    = None
+        self._insertion    = None
+        self.on_force      = None     # optional callback(z, force_n)
+        self.use_force_sensing = True # False: comparison runs only
+        self.pockets       = {}       # part name -> nominal pocket
+        self.stations      = {}       # part name -> supply station (x, y)
         self.logger        = logger
         self.robot_config  = config["robot_limits"]
         self.sim_config    = config["sim"]
@@ -244,7 +249,8 @@ class FrankaPandaRobot:
     # Scene management
     # ----------------------------------------------------------
 
-    def add_object(self, name, x, y, color, z=0.05, half_extent=0.025):
+    def add_object(self, name, x, y, color, z=0.05, half_extent=0.025,
+                   grasp_depth=None):
         col    = p.createCollisionShape(
             p.GEOM_BOX, halfExtents=[half_extent] * 3
         )
@@ -270,7 +276,9 @@ class FrankaPandaRobot:
 
         self.objects[name] = {
             "id": obj_id, "color": color, "position": [x, y, z],
-            "half_extent": half_extent
+            "half_extent": half_extent,
+            "grasp_depth": (self.GRASP_DEPTH if grasp_depth is None
+                            else grasp_depth)
         }
         self.logger.info(f"Added object '{name}' at ({x}, {y}, {z})")
         self._sync_obstacles()
@@ -586,6 +594,17 @@ class FrankaPandaRobot:
         # parts close to the base). If the arm cannot hold position
         # with it, give up the orientation, not the position.
         ee = self.get_end_effector_position()
+        # Give the arm time to settle on the pose before deciding
+        # it cannot hold a vertical tool there. A part gripped with
+        # a tilted tool is tilted when it is put down.
+        for _ in range(5):
+            if math.hypot(x - ee[0], y - ee[1]) <= 0.002:
+                break
+            hold_xy(1.0)
+            self._direct_move(x + off_x, y + off_y, approach_z,
+                              speed_factor=0.15, orn=orn)
+            ee = self.get_end_effector_position()
+
         if math.hypot(x - ee[0], y - ee[1]) > 0.008:
             print(f"  [DESCENT] Vertical tool not reachable here — "
                   f"position-only approach")
@@ -605,7 +624,7 @@ class FrankaPandaRobot:
         current_z = approach_z
         frame_count = 0
         while current_z > min_z:
-            current_z -= step_size
+            current_z = max(min_z, current_z - step_size)
             hold_xy(0.5)
             self._direct_move(x + off_x, y + off_y, current_z,
                               speed_factor=0.02, orn=orn)
@@ -735,7 +754,8 @@ class FrankaPandaRobot:
             start_z          = ee_now[2],
             torque_threshold = 8.0,
             step_size        = 0.004,
-            floor_z          = pos[2] - self.GRASP_DEPTH
+            floor_z          = pos[2] - self.objects[name].get(
+                "grasp_depth", self.GRASP_DEPTH)
         )
 
         # Force-controlled grip
@@ -837,6 +857,31 @@ class FrankaPandaRobot:
                        f"({pos[0]:.2f},{pos[1]:.2f},{pos[2]:.2f})")
         }
 
+    def insert_part(self, name, pocket, on_step=None):
+        """Seat the held part in a pocket by force-guided insertion."""
+        from motion.insertion import ForceGuidedInsertion
+        if self._insertion is None:
+            self._insertion = ForceGuidedInsertion(self)
+        result = self._insertion.insert(name, pocket,
+                                        on_step=on_step or self.on_force,
+                                        use_force=self.use_force_sensing)
+        self._sync_obstacles()
+        return result
+
+    def _retreat_straight_up(self, orn, clear_z=0.45):
+        """Leave a placed part without dragging it sideways."""
+        ee_up = self.get_end_effector_position()
+        off_x = off_y = 0.0
+        for i in range(1, 8):
+            self._direct_move(ee_up[0] + off_x, ee_up[1] + off_y,
+                              ee_up[2] + 0.01 * i,
+                              speed_factor=0.08, orn=orn)
+            now = self.get_end_effector_position()
+            off_x += 0.5 * (ee_up[0] - now[0])
+            off_y += 0.5 * (ee_up[1] - now[1])
+        self._direct_move(ee_up[0], ee_up[1], clear_z, speed_factor=0.4,
+                          orn=orn)
+
     def place_object(self, x, y, stack_on=None):
         if not self.grasped_object:
             return {
@@ -898,12 +943,37 @@ class FrankaPandaRobot:
 
         # Physics-driven descent - feel the surface
         ee_now = self.get_end_effector_position()
-        self._descend_until_contact(
-            x, y,
-            start_z=ee_now[2],
-            torque_threshold=6.0,
-            step_size=0.003
-        )
+        if stack_on and stack_pos:
+            # Stacking leaves no room for error: square the tool,
+            # measure where the part sits in the gripper, aim the
+            # part (not the gripper) at the base, and stop just above
+            # the base instead of pressing down until something gives.
+            orn = self._down_orientation()
+            for _ in range(3):
+                self._direct_move(x, y, ee_now[2], speed_factor=0.15,
+                                  orn=orn)
+            ee_now  = self.get_end_effector_position()
+            held    = self.get_object_position(placed)
+            base_h  = self.objects[stack_on].get("half_extent", 0.025)
+            part_h  = self.objects[placed].get("half_extent", 0.025)
+            aim_x   = x - (held[0] - ee_now[0])
+            aim_y   = y - (held[1] - ee_now[1])
+            floor_z = (stack_pos[2] + base_h + part_h
+                       + (ee_now[2] - held[2]) + 0.002)
+            self._descend_until_contact(
+                aim_x, aim_y,
+                start_z=ee_now[2],
+                torque_threshold=6.0,
+                step_size=0.003,
+                floor_z=floor_z
+            )
+        else:
+            self._descend_until_contact(
+                x, y,
+                start_z=ee_now[2],
+                torque_threshold=6.0,
+                step_size=0.003
+            )
 
         # Settle on surface
         for _ in range(60):
@@ -934,8 +1004,13 @@ class FrankaPandaRobot:
 
         # Rise away cleanly - straight up first, then move
         released = self.get_object_position(placed)
-        self._direct_move(x, y, 0.45, speed_factor=0.6,
-                          orn=self._tool_orn)
+        if stack_on:
+            # Straight up and slowly at first: any sideways motion
+            # here drags the part off the one below it.
+            self._retreat_straight_up(self._tool_orn)
+        else:
+            self._direct_move(x, y, 0.45, speed_factor=0.6,
+                              orn=self._tool_orn)
 
         # Release confirmation: the part must stay where it was put
         # down, not come back up with the gripper.

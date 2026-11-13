@@ -26,7 +26,7 @@ python -m pip install "pymodbus>=3.16,<4"     # optional: Modbus TCP test
 python -m pytest -q
 ```
 
-Expected: **79 passed** in about 20 seconds (76 if `pymodbus` is not
+Expected: **86 passed** in about a minute (83 if `pymodbus` is not
 installed; those three are skipped). Two of the tests run the full cell in
 physics.
 
