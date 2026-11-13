@@ -159,7 +159,7 @@ def main():
 
         with contextlib.redirect_stdout(io.StringIO()):
             if args.scene != "assembly":
-            refill_infeed(cell.robot)
+                refill_infeed(cell.robot)
         poll(cell)
 
     cell.soft_plc.stop()
