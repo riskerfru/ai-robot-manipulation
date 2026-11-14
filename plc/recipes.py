@@ -28,10 +28,12 @@ RECIPES = {
         ],
     },
     3: {
-        "name": "assemble unit: motor, bearing, sensor",
+        # Centre pocket first: with a taller component already seated
+        # beside it, the centre insertion was unreliable in testing.
+        "name": "assemble unit: bearing, motor, sensor",
         "subtasks": [
-            {"action": "insert", "object": "motor"},
             {"action": "insert", "object": "bearing"},
+            {"action": "insert", "object": "motor"},
             {"action": "insert", "object": "sensor"},
         ],
     },

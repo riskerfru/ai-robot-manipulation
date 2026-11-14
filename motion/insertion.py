@@ -91,12 +91,28 @@ class ForceGuidedInsertion:
         rim_z  = seat_z + pocket["depth"]
         x, y   = pocket["x"], pocket["y"]
 
-        # Above the pocket, tool vertical and square to the housing.
-        r._direct_move(x, y, rim_z + 0.06, speed_factor=0.3)
-        orn = r._down_orientation()
+        # Travel to the pocket at a height that clears parts already
+        # standing in the fixture, and only then come down. Arriving
+        # on a diagonal sweeps the held part through its neighbours.
+        safe_z = rim_z + 0.10
+        for _ in range(8):
+            r._direct_move(x, y, safe_z, speed_factor=0.3)
+            ee = r.get_end_effector_position()
+            if math.hypot(x - ee[0], y - ee[1]) < 0.004:
+                break
+
+        # Tool vertical and square to the fixture, still at safe height.
+        orn = r._down_orientation(pocket.get("finger_axis"))
         r._tool_orn = orn
-        for _ in range(4):
-            self._move(x, y, rim_z + 0.03, orn, speed=0.15)
+        for _ in range(6):
+            ee = self._move(x, y, safe_z, orn, speed=0.15)
+            if math.hypot(x - ee[0], y - ee[1]) < 0.001:
+                break
+        if math.hypot(x - ee[0], y - ee[1]) > 0.004:
+            return {"status": "failed", "action": "insert", "target": part,
+                    "detail": f"could not get above the pocket for '{part}'"}
+        for _ in range(2):
+            self._move(x, y, rim_z + 0.03, orn, speed=0.1)
 
         peak = 0.0
         searched = False
@@ -142,7 +158,7 @@ class ForceGuidedInsertion:
         z, f = lower_until_contact(x, y, rim_z + 0.03, floor_cmd)
 
         if not use_force:
-            self._release(part)
+            self._release(part, pocket.get("release_open"))
             r._retreat_straight_up(orn)
             return {
                 "status": "success", "action": "insert", "target": part,
@@ -186,7 +202,7 @@ class ForceGuidedInsertion:
                     "search_offset_mm": round(1000 * math.hypot(*offset), 1),
                 }
 
-        self._release(part)
+        self._release(part, pocket.get("release_open"))
         r._retreat_straight_up(orn)
 
         pos = r.get_object_position(part)
@@ -199,6 +215,7 @@ class ForceGuidedInsertion:
             "peak_force_n": round(peak, 1),
             "searched": searched,
             "search_offset_mm": round(1000 * math.hypot(*offset), 1),
+            "search_offset_xy": (round(offset[0], 5), round(offset[1], 5)),
             "detail": (f"'{part}' seated ({base_err * 1000:+.1f} mm), "
                        f"peak {peak:.0f} N"
                        + (f", found by search {1000 * math.hypot(*offset):.0f} mm"
@@ -209,11 +226,11 @@ class ForceGuidedInsertion:
         }
         return result
 
-    def _release(self, part):
+    def _release(self, part, open_to=None):
         r = self.robot
         if r.grasp_constraint is not None:
             p.removeConstraint(r.grasp_constraint)
             r.grasp_constraint = None
-        r.open_gripper()
+        r.open_gripper(open_to)
         self._settle(60)
         r.grasped_object = None

@@ -11,6 +11,11 @@
 #   python record_demo.py guard       guard door opens mid-job
 #   python record_demo.py verify      the same knocked part, without
 #                                     and with placement measurement
+#   python record_demo.py packing     FMCG mixed-case packing with a format
+#                                     changeover, planned from typed orders
+#                                     by the language model (needs
+#                                     ANTHROPIC_API_KEY; --offline uses the
+#                                     built-in parser instead)
 #   python record_demo.py assembly    three components seated in a housing
 #                                     by force-guided insertion
 #   python record_demo.py assembly-compare
@@ -93,7 +98,24 @@ F_CARD_T = font("bold", 44)
 F_CARD_B = font("regular", 24)
 
 
+def wrap(text, width=44):
+    lines = [""]
+    for word in text.split():
+        if lines[-1] and len(lines[-1]) + 1 + len(word) > width:
+            lines.append("")
+        lines[-1] = (lines[-1] + " " + word).strip()
+    return lines
+
+
+def short(part):
+    """'lemon_s1' -> 'lemon'; other names unchanged."""
+    head, _, tail = part.partition("_")
+    return head if tail[:1] in ("s", "t") and tail[1:].isdigit() else part
+
+
 def describe(subtask):
+    if subtask.get("label"):
+        return subtask["label"][:1].upper() + subtask["label"][1:]
     action = subtask.get("action")
     if action == "pick":
         return f"Pick {subtask.get('object')}"
@@ -129,6 +151,8 @@ class Hud:
         self.force = None                # live contact force (N), assembly
         self.force_trace = []
         self.result_label = "Last placement"
+        self.plan_line = None            # packing: the validated plan
+        self.show_guard = True
 
     def event(self, text, colour=TEXT):
         self.events.append((self.sim_time, text, colour))
@@ -141,13 +165,45 @@ class Hud:
             self.order_text = d.get("name", "")
             self.truth = None
             self.event(f"PLC: JOB_START job {d['job_id']}", BLUE)
+        elif name == "order_text":
+            self.order_source = "Operator, typed order"
+            self.order_text = d["order"]
+            self.free_text = True
+            self.cell_state = "BUSY"
+            self.tasks = []
+            self.truth = None
+            self.plan_line = ("planning...", MUTED)
+        elif name == "order_plan":
+            items = ", ".join(f"{q} {f}" for f, q in d["items"])
+            self.plan_line = (f"Plan: {d['format']} tray, {items}", GREEN)
+            self.event(f"Plan from {d['source']}", BLUE)
+            self.event(f"Plan checked: fills {d['nests']} nests, stock OK",
+                       GREEN)
+        elif name == "order_refused":
+            self.plan_line = ("Order refused", RED)
+            self.cell_state = "READY"
+            self.measure = (d["reason"][:52], RED)
+            self.event(f"REFUSED: {d['reason'][:34]}", RED)
+        elif name == "changeover":
+            self.event(f"Changeover {d['from_format']} to {d['to_format']}: "
+                       f"{d['carton_mm']} mm", AMBER)
+            self.event(f"New pattern {d['pattern']}, from the SKU master",
+                       AMBER)
+        elif name == "tray_out":
+            self.event(f"Tray out: {d['cartons']} cartons", MUTED)
+        elif name == "tray_in":
+            self.event(f"Empty {d['format']} tray in position", MUTED)
+        elif name == "tray_check":
+            self.event(f"Tray check: {d['seated']} of {d['nests']} seated",
+                       GREEN if d["seated"] == d["nests"] else RED)
         elif name == "order_received":
             if not d.get("recipe"):
                 self.order_source = "Operator, free text"
                 self.free_text = True
                 self.cell_state = "BUSY"
                 self.truth = None
-            self.order_text = d.get("order", self.order_text)
+            if self.plan_line is None:
+                self.order_text = d.get("order", self.order_text)
         elif name == "order_decomposed":
             self.tasks = [[describe(s), "pending"] for s in d["subtasks"]]
         elif name in ("recipe_decision", "llm_decision"):
@@ -189,14 +245,15 @@ class Hud:
                 self.event(f"Measured {part}: FAILED", RED)
         elif name == "insertion":
             r = d["result"]
-            part = d["part"]
+            part = short(d["part"])
             if r.get("unverified"):
                 self.measure = (f"{part}: released at nominal, not checked",
                                 AMBER)
                 self.event(f"{part}: released, not checked", AMBER)
             elif r["status"] == "success":
                 how = (f"search {r['search_offset_mm']:.0f} mm, "
-                       if r.get("searched") else "")
+                       if r.get("searched") else
+                       "straight in, " if r.get("start_offset_mm") else "")
                 self.measure = (f"{part} seated: {how}"
                                 f"peak {r['peak_force_n']:.0f} N", GREEN)
                 self.event(f"Seated {part}: {how}peak "
@@ -248,28 +305,42 @@ class Hud:
         d.text((x0, y), self.order_source or "Waiting for a job",
                font=F_SMALL, fill=BLUE)
         y += 20
-        d.text((x0, y), self.order_text[:44] or "-", font=F_BODY, fill=TEXT)
-        y += 30
+        for line in (wrap(self.order_text)[:2] or ["-"]):
+            d.text((x0, y), line, font=F_BODY, fill=TEXT)
+            y += 21
+        if self.plan_line:
+            d.text((x0, y + 1), self.plan_line[0][:52], font=F_SMALL,
+                   fill=self.plan_line[1])
+            y += 20
+        y += 9
 
+        compact = len(self.tasks) > 4      # long task lists: tighter panel
         label("Tasks")
         for text, status in self.tasks[:7] or [["-", "pending"]]:
             self._mark(d, x0, y, status)
             d.text((x0 + 24, y - 2), text,
                    font=F_BOLD if status == "current" else F_BODY,
                    fill=TEXT if status != "pending" else MUTED)
-            y += 23
+            y += 20 if compact else 23
         y += 8
 
-        label("Cell")
+        if compact:
+            d.line([(x0, y), (x1, y)], fill=LINE, width=1)
+            y += 12
+        else:
+            label("Cell")
         self._pill(d, x0, y, "CELL " + self.cell_state,
                    {"READY": GREEN, "BUSY": BLUE, "DONE": GREEN,
                     "FAULT": RED}.get(self.cell_state, MUTED))
         self._pill(d, x0 + 150, y, "SAFETY " + self.safety_state.replace("_", " "),
                    GREEN if self.safety_state == "RUN" else RED)
         y += 34
-        d.text((x0, y), "Guard door: " + ("closed" if self.guard_closed else "OPEN"),
-               font=F_SMALL, fill=MUTED if self.guard_closed else RED)
-        y += 28
+        if self.show_guard:
+            d.text((x0, y), "Guard door: "
+                   + ("closed" if self.guard_closed else "OPEN"),
+                   font=F_SMALL, fill=MUTED if self.guard_closed else RED)
+            y += 20
+        y += 8
 
         if self.force is not None:
             label("Contact force on the part")
@@ -287,34 +358,39 @@ class Hud:
                    font=F_BOLD, fill=TEXT)
             y += 24
             trace = self.force_trace[-120:]
+            h = 24 if compact else 34
             if len(trace) > 1:
-                h = 34
                 pts = [(x0 + i * (x1 - x0) / 119,
                         y + h - min(1.0, f / 60.0) * h)
                        for i, f in enumerate(trace)]
                 d.line(pts, fill=BLUE, width=2)
-            d.line([(x0, y + 34), (x1, y + 34)], fill=LINE, width=1)
-            y += 44
+            y += h + 8
 
         label(self.result_label)
         d.text((x0, y), self.measure[0][:52], font=F_BODY, fill=self.measure[1])
-        y += 32
+        y += 28 if compact else 32
 
         if self.truth is not None:
             label("True position (simulator)")
-            for part, drift, ok in self.truth:
-                self._mark(d, x0, y, "done" if ok else "failed")
+            two_up = len(self.truth) > 4
+            for i, (part, drift, ok) in enumerate(self.truth):
                 text = (drift if isinstance(drift, str)
                         else f"{drift:.1f} cm from slot centre")
-                d.text((x0 + 24, y - 2), f"{part}: {text}",
-                       font=F_BODY, fill=TEXT if ok else RED)
-                y += 22
+                tx = x0 + ((x1 - x0) // 2 if two_up and i % 2 else 0)
+                self._mark(d, tx, y, "done" if ok else "failed")
+                d.text((tx + 24, y - 2), f"{part}: {text}",
+                       font=F_SMALL if two_up else F_BODY,
+                       fill=TEXT if ok else RED)
+                if not two_up or i % 2 or i == len(self.truth) - 1:
+                    y += 22
         else:
             label("Audit trail")
-            for t, text, colour in self.events[-5:]:
+            row = 19 if compact else 21
+            room = max(1, (H - 44 - y) // row)       # stay above the footer
+            for t, text, colour in self.events[-min(room, 5):]:
                 d.text((x0, y), f"{t:6.1f}s", font=F_MONO, fill=MUTED)
                 d.text((x0 + 68, y - 1), text[:40], font=F_SMALL, fill=colour)
-                y += 21
+                y += row
 
         d.text((x0, H - 30), self.footer, font=F_SMALL, fill=MUTED)
         d.text((16, H - 30), f"Simulation  ·  {self.speed:.0f}x speed  ·  "
@@ -431,7 +507,7 @@ def make_cell(rec, hud, llm=False, scene="dispatch",
                               housing_offset=housing_offset)
     cell.dressing = CellDressing(cell.robot)
     cell.housing_offset = housing_offset
-    if scene == "assembly":
+    if scene in ("assembly", "packing"):
         connect_assembly_view(cell, rec, hud)
     original_log = cell.audit.log
 
@@ -744,6 +820,55 @@ def scenario_assembly_compare(rec, offset_mm=(3.0, 2.5)):
     cell.soft_plc.stop()
 
 
+def scenario_packing(rec, orders, offline=False):
+    """Typed orders, a planned case, force-guided packing, a changeover."""
+    from packing_orders import make_planner, run_order
+    planner, label = make_planner(offline)
+    hud = Hud("Mixed-case packing",
+              "Typed order, planned case, force-guided packing",
+              f"Planner: {label}")
+    hud.show_guard = False
+    cell = make_cell(rec, hud, scene="packing",
+                     housing_offset=(0.002, -0.0015))
+    hud.measure = ("No carton packed yet", MUTED)
+    rec.hold(1.5)
+
+    seated = total = 0
+    refused = []
+    for number, order in enumerate(orders):
+        lines = wrap(order, 56)
+        lines[0] = '"' + lines[0]
+        lines[-1] += '"'
+        rec.card("The operator types an order" if number == 0
+                 else "The operator types the next order", lines,
+                 seconds=4.0)
+        hud.on_audit("order_text", {"order": order})
+        hud.cell_state = "READY" if number == 0 else hud.cell_state
+        rec.hold(1.0)
+        out = quiet(run_order, cell, order, planner, tray_number=number)
+        if "refused" in out:
+            refused.append(out["refused"])
+            rec.hold(5.0)
+            continue
+        hud.truth = [(f"nest {c['nest']} {c['flavour']}",
+                      "seated" if c["seated"]
+                      else f"NOT seated ({c['gap_mm']:.0f} mm up)",
+                      c["seated"]) for c in out["check"]]
+        seated += sum(c["seated"] for c in out["check"])
+        total += len(out["check"])
+        rec.hold(5.0)
+
+    lines = [f"{seated} of {total} cartons seated in nests with 2 mm clearance.",
+             "Each tray sat a few millimetres off its mark; the robot was "
+             "not told.",
+             "The format change came from a typed order and the SKU master."]
+    if refused:
+        lines.append(f"{len(refused)} order(s) refused: {refused[0][:60]}")
+    lines.append(f"Planner: {label}. Simulation.")
+    rec.card("Result", lines, seconds=6.0)
+    cell.soft_plc.stop()
+
+
 def scenario_order(rec, text, scene="dispatch"):
     if not cfg.ANTHROPIC_API_KEY:
         sys.exit("ANTHROPIC_API_KEY is not set; this scenario needs the "
@@ -778,7 +903,13 @@ def scenario_order(rec, text, scene="dispatch"):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("scenario", choices=["normal", "guard", "verify", "order",
-                                         "assembly", "assembly-compare"])
+                                         "assembly", "assembly-compare",
+                                         "packing"])
+    ap.add_argument("--orders", nargs="+", default=None,
+                    help="packing: the orders to type, in sequence")
+    ap.add_argument("--offline", action="store_true",
+                    help="packing: plan with the built-in parser instead "
+                         "of the language model")
     ap.add_argument("--scene", default="dispatch",
                     choices=["dispatch", "assembly"],
                     help="cell used by the 'order' scenario")
@@ -799,6 +930,10 @@ def main():
             scenario_assembly(rec)
         elif args.scenario == "assembly-compare":
             scenario_assembly_compare(rec)
+        elif args.scenario == "packing":
+            from run_packing import ORDER_1, ORDER_2
+            scenario_packing(rec, args.orders or [ORDER_1, ORDER_2],
+                             args.offline)
         else:
             scenario_order(rec, args.text, args.scene)
     finally:

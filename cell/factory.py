@@ -63,8 +63,19 @@ def build_sim_cell(logger, gui=False, seed=None, randomize=False,
         A.add_housing((A.HOUSING_CENTRE[0] + housing_offset[0],
                        A.HOUSING_CENTRE[1] + housing_offset[1]))
         A.add_components(robot)
+        robot.use_pocket_bias = True
         robot.pockets = {n: A.pocket_for(n) for n in A.COMPONENTS}
         robot.stations = {n: c["station"] for n, c in A.COMPONENTS.items()}
+        for _ in range(100):
+            robot.step()
+    elif scene == "packing":
+        # Shelf-ready tray on the conveyor, cartons in two formats on
+        # the infeed. The tray is a few millimetres off its mark.
+        from cell.packing import PackingLine
+        positions = {}
+        build_cell(robot, part_positions={}, gui=gui)
+        robot.use_pocket_bias = True
+        robot.packing_line = PackingLine(robot, "standard", housing_offset)
         for _ in range(100):
             robot.step()
     else:

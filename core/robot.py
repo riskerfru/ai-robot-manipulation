@@ -35,9 +35,13 @@ class FrankaPandaRobot:
         self.config        = config
         self._tool_orn     = None
         self._ik_limits    = None
+        self._finger_yaw   = None
         self._insertion    = None
         self.on_force      = None     # optional callback(z, force_n)
         self.use_force_sensing = True # False: comparison runs only
+        self.pocket_bias   = (0.0, 0.0)   # learned fixture offset (x, y)
+        self.pocket_bias_samples = []
+        self.use_pocket_bias = False      # packing cell turns this on
         self.pockets       = {}       # part name -> nominal pocket
         self.stations      = {}       # part name -> supply station (x, y)
         self.logger        = logger
@@ -173,9 +177,22 @@ class FrankaPandaRobot:
     # Gripper
     # ----------------------------------------------------------
 
-    def open_gripper(self):
-        """Open fingers fully - 4cm gap, clearly visible"""
+    def open_gripper(self, width=None):
+        """
+        Open the fingers. width (m, per finger from the centre) opens
+        them only that far, for releasing next to another part.
+        """
         if not self.finger_joints:
+            return
+        if width is not None:
+            for joint in self.finger_joints:
+                p.setJointMotorControl2(
+                    self.robot, joint, p.POSITION_CONTROL,
+                    targetPosition=min(0.04, width), force=80,
+                    maxVelocity=0.05)
+            for _ in range(60):
+                p.stepSimulation()
+                time.sleep(self.sim_config["timestep"])
             return
         for target in [0.01, 0.02, 0.03, 0.04]:
             for joint in self.finger_joints:
@@ -250,7 +267,7 @@ class FrankaPandaRobot:
     # ----------------------------------------------------------
 
     def add_object(self, name, x, y, color, z=0.05, half_extent=0.025,
-                   grasp_depth=None):
+                   grasp_depth=None, vision=True):
         col    = p.createCollisionShape(
             p.GEOM_BOX, halfExtents=[half_extent] * 3
         )
@@ -277,6 +294,7 @@ class FrankaPandaRobot:
         self.objects[name] = {
             "id": obj_id, "color": color, "position": [x, y, z],
             "half_extent": half_extent,
+            "vision": vision,
             "grasp_depth": (self.GRASP_DEPTH if grasp_depth is None
                             else grasp_depth)
         }
@@ -403,15 +421,39 @@ class FrankaPandaRobot:
         self._execute_trajectory(trajectory, velocities)
         return True
 
-    def _down_orientation(self):
+    def _down_orientation(self, finger_axis=None):
         """
         Gripper pointing straight down with the fingers square to
         the cell axes, at the quarter turn nearest the current yaw.
+        finger_axis "x" or "y" fixes which way the fingers open (for
+        nests with a neighbour on one side); the nearest half turn
+        is used.
         """
         current = p.getLinkState(self.robot, self.end_effector)[1]
         yaw     = p.getEulerFromQuaternion(current)[2]
-        yaw     = round(yaw / (math.pi / 2)) * (math.pi / 2)
+        if finger_axis in ("x", "y"):
+            base = self._finger_yaw_for_y()
+            if finger_axis == "x":
+                base += math.pi / 2
+            yaw  = base + round((yaw - base) / math.pi) * math.pi
+        else:
+            yaw  = round(yaw / (math.pi / 2)) * (math.pi / 2)
         return p.getQuaternionFromEuler([math.pi, 0.0, yaw])
+
+    def _finger_yaw_for_y(self):
+        """
+        Tool yaw at which the fingers open along the cell's y axis,
+        worked out from where the two finger links actually are.
+        """
+        if self._finger_yaw is None:
+            a = p.getLinkState(self.robot, self.finger_joints[0])[0]
+            b = p.getLinkState(self.robot, self.finger_joints[1])[0]
+            world = math.atan2(b[1] - a[1], b[0] - a[0])
+            tool = p.getEulerFromQuaternion(
+                p.getLinkState(self.robot, self.end_effector)[1])[2]
+            # fingers lie along `world` when the tool yaw is `tool`
+            self._finger_yaw = (tool - world) + math.pi / 2
+        return self._finger_yaw
 
     def _ik_with_orientation(self, point, orn):
         """Joint-limit-aware IK for a full tool pose."""
@@ -672,6 +714,17 @@ class FrankaPandaRobot:
                           f"torque={total:.1f} baseline={baseline:.1f}")
                     return current_z
 
+        if floor_z is not None:
+            # At the grasp height: close any remaining sideways error
+            # before the fingers shut, so the part is gripped centred.
+            for _ in range(6):
+                ee = self.get_end_effector_position()
+                if math.hypot(x - ee[0], y - ee[1]) <= 0.001:
+                    break
+                hold_xy(1.0)
+                self._direct_move(x + off_x, y + off_y, current_z,
+                                  speed_factor=0.05, orn=orn)
+
         print(f"  [DESCENT] Reached min z={current_z:.3f}m")
         return current_z
 
@@ -731,8 +784,16 @@ class FrankaPandaRobot:
                 "detail": f"cannot reach above '{name}' — RRT failed"
             }
 
-        print(f"  [PICK] Above target - visual servoing...")
-        aligned_x, aligned_y = self.servo.servo_to_object(self, name)
+        if self.objects[name].get("vision", True):
+            print(f"  [PICK] Above target - visual servoing...")
+            aligned_x, aligned_y = self.servo.servo_to_object(self, name)
+        else:
+            # Parts the wrist camera is not set up to recognise are
+            # picked from their reported position.
+            aligned_x, aligned_y = pos[0], pos[1]
+            self._direct_move(aligned_x, aligned_y,
+                              self.get_end_effector_position()[2],
+                              speed_factor=0.3)
 
         # If servoing gave up (part outside the camera's reliable
         # range), the gripper may still be centimetres off. Descend
@@ -811,7 +872,10 @@ class FrankaPandaRobot:
             parentFrameOrientation = [0, 0, 0, 1],
             childFrameOrientation  = child_orn
         )
-        p.changeConstraint(self.grasp_constraint, maxForce=50)
+        # Parts that are force-fitted must not slip in the grip when
+        # they meet a rim: the insertion judges depth from the gripper.
+        grip_n = 50 if self.objects[name].get("vision", True) else 200
+        p.changeConstraint(self.grasp_constraint, maxForce=grip_n)
         self.grasped_object         = name
         self.rrt.carrying_clearance = 0.04
 
@@ -862,23 +926,48 @@ class FrankaPandaRobot:
         from motion.insertion import ForceGuidedInsertion
         if self._insertion is None:
             self._insertion = ForceGuidedInsertion(self)
-        result = self._insertion.insert(name, pocket,
+
+        # Start from where earlier parts showed this fixture really is.
+        bias = self.pocket_bias if self.use_pocket_bias else (0.0, 0.0)
+        target = dict(pocket, x=pocket["x"] + bias[0],
+                      y=pocket["y"] + bias[1])
+        result = self._insertion.insert(name, target,
                                         on_step=on_step or self.on_force,
                                         use_force=self.use_force_sensing)
+        if (result.get("status") == "success"
+                and "search_offset_xy" in result):
+            dx, dy = result["search_offset_xy"]
+            self.pocket_bias_samples.append((bias[0] + dx, bias[1] + dy))
+            n = len(self.pocket_bias_samples)
+            self.pocket_bias = (
+                sum(s[0] for s in self.pocket_bias_samples) / n,
+                sum(s[1] for s in self.pocket_bias_samples) / n)
+        result["start_offset_mm"] = round(
+            1000 * math.hypot(bias[0], bias[1]), 1)
         self._sync_obstacles()
         return result
 
     def _retreat_straight_up(self, orn, clear_z=0.45):
-        """Leave a placed part without dragging it sideways."""
+        """
+        Leave a placed part without dragging it. The first millimetres
+        are taken in small steps with the sideways position corrected
+        before each one: a finger that drifts into the part here
+        carries it back up out of its seat.
+        """
         ee_up = self.get_end_effector_position()
         off_x = off_y = 0.0
-        for i in range(1, 8):
-            self._direct_move(ee_up[0] + off_x, ee_up[1] + off_y,
-                              ee_up[2] + 0.01 * i,
-                              speed_factor=0.08, orn=orn)
-            now = self.get_end_effector_position()
-            off_x += 0.5 * (ee_up[0] - now[0])
-            off_y += 0.5 * (ee_up[1] - now[1])
+        for rise in (0.002, 0.004, 0.006, 0.009, 0.012, 0.016, 0.02,
+                     0.03, 0.04, 0.055, 0.07):
+            for _ in range(2):
+                self._direct_move(ee_up[0] + off_x, ee_up[1] + off_y,
+                                  ee_up[2] + rise,
+                                  speed_factor=0.08, orn=orn)
+                now = self.get_end_effector_position()
+                error = math.hypot(ee_up[0] - now[0], ee_up[1] - now[1])
+                off_x += ee_up[0] - now[0]
+                off_y += ee_up[1] - now[1]
+                if error < 0.0007:
+                    break
         self._direct_move(ee_up[0], ee_up[1], clear_z, speed_factor=0.4,
                           orn=orn)
 

@@ -3,6 +3,41 @@
 All numbers here come from the PyBullet simulation. Nothing has been
 measured on a real robot.
 
+> **Status of the dispatch numbers below.** They were measured before the
+> pick routine was changed again for the assembly and packing cells (final
+> centring before the grasp, a careful retreat, a longer settle to a vertical
+> tool). The unit tests pass on the current code, but the 720-placement
+> evaluation has not been re-run, so treat those figures as describing the
+> earlier commit.
+
+## Packing cell (current code)
+
+Nine complete runs of the two default orders, planned by the built-in
+parser, each with both trays placed at a random offset of up to 2.5 mm in x
+and y that the controller is not told:
+
+| | Result |
+|---|---|
+| Cartons seated at the first attempt | 90 of 90 |
+| Trays complete | 18 of 18 |
+| Nest clearance | 2 mm per side |
+| Largest tray offset | 3.2 mm |
+| Peak contact force per run | 38 to 110 N |
+
+Ninety cartons with no failure puts the true failure rate below about 4 %
+at 95 % confidence; it does not show that it is zero. The contact forces are
+high because the arm is stepped in stiff position control. The language
+model was not part of these runs: its replies are tested with a stand-in
+client in `tests/test_packing.py`.
+
+## Assembly cell (current code)
+
+Four runs of recipe 3 with the housing offset by up to 2.7 mm: three
+completed with all three components seated, and one ended in a fault with
+the third component reported as not seated. Clearance is 1.5 mm per side
+and the components differ in size, which makes this cell less forgiving
+than the packing cell.
+
 ## What was measured
 
 `eval_physics.py` runs the complete cell headless and scores every placement

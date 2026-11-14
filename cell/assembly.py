@@ -13,7 +13,7 @@ import pybullet as p
 from cell import layout as L
 
 HOUSING_CENTRE = L.CONVEYOR_SLOTS[2]
-HOUSING_HALF   = (0.055, 0.135)          # x, y
+HOUSING_HALF   = (0.055, 0.150)          # x, y
 BASE_Z         = L.TABLE_Z + 0.016       # top of the conveyor fixture plate
 PLATE_T        = 0.004                   # housing floor thickness
 POCKET_DEPTH   = 0.008
@@ -26,11 +26,11 @@ STATION_COLOUR = [0.78, 0.80, 0.83, 1.0]
 # name -> size (cube edge), colour, station centre, pocket offset along y
 COMPONENTS = {
     "motor":   {"size": 0.050, "colour": [0.93, 0.50, 0.12, 1.0],
-                "station": (0.40,  0.30), "pocket_dy":  0.085},
+                "station": (0.40,  0.30), "pocket_dy":  0.100},
     "bearing": {"size": 0.040, "colour": [0.20, 0.62, 0.78, 1.0],
                 "station": (0.40,  0.00), "pocket_dy":  0.000},
     "sensor":  {"size": 0.035, "colour": [0.55, 0.36, 0.78, 1.0],
-                "station": (0.40, -0.30), "pocket_dy": -0.085},
+                "station": (0.40, -0.30), "pocket_dy": -0.100},
 }
 
 
@@ -49,6 +49,12 @@ def pocket_for(name, housing_xy=HOUSING_CENTRE):
         "depth": POCKET_DEPTH,
         "half": c["size"] / 2,
         "clearance": CLEARANCE,
+        # Same finger direction as at the supply stations, so the part
+        # is not turned on the way (a square part turned by two degrees
+        # no longer fits a 1.5 mm clearance). The fingers then open
+        # towards the neighbouring pockets, so only a little.
+        "finger_axis": "y",
+        "release_open": c["size"] / 2 + 0.009,
     }
 
 
@@ -105,4 +111,5 @@ def add_components(robot, positions=None):
                                         L.TABLE_Z + 0.002])
         robot.add_object(name, x=x, y=y, color=c["colour"],
                          z=L.TABLE_Z + half + 0.004, half_extent=half,
-                         grasp_depth=half - FINGER_LIFT)
+                         grasp_depth=half - FINGER_LIFT,
+                         vision=False)

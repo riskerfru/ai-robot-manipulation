@@ -76,8 +76,8 @@ def test_assembly_job_seats_three_components_in_a_shifted_housing():
             assert abs(y - pocket["y"]) <= pocket["clearance"] + 0.0005
         results = [r["data"]["result"]
                    for r in cell.audit.events("insertion")]
-        assert len(results) == 3
-        assert all(r["status"] == "success" for r in results)
+        # A component may need a second attempt; none may be skipped.
+        assert sum(r["status"] == "success" for r in results) == 3
     finally:
         cell.soft_plc.stop()
         p.disconnect()

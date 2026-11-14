@@ -27,6 +27,11 @@ What was tried, what the evidence was, and what was kept.
 | Placement tolerance tightened from 8 cm to 2 cm, set in `config.PLACEMENT` | 8 cm was hiding the placement error above | `config.py` |
 | Slot calibration measures against the commanded position, is applied on the first place, and ignores scattered errors | A corrected placement that landed on target was diluting the learned offset; random knocks were being learned as offsets | `tests/test_verifier_honesty.py` |
 | Stored `slot_calibration.json` removed from the repository | It held a 5 cm offset learned from stub runs and was loaded on every start | `.gitignore` |
+| Mixed-case packing cell with a typed format changeover | An FMCG use case: the model turns a typed order into a small plan, code validates it against the SKU master and stock, the robot packs it | `cell/packing.py`, `packing_orders.py`, `tests/test_packing.py` |
+| Parts the wrist camera is not set up for are picked from their reported position | The pick used wherever visual servoing gave up, up to 1 cm off, so parts sat off-centre in the gripper | `core/robot.py` |
+| Insertion travels to the pocket at a safe height before lowering | Arriving on a diagonal swept the held part through parts already in the fixture | `motion/insertion.py` |
+| Fixture offset learned from the first insertion and reused | Later parts go straight in instead of searching again | `core/robot.py`, `insert_part` |
+| Careful retreat after release; fingers open only as far as the neighbours allow | A finger that drifted on the way up carried the part back out of its nest | `core/robot.py` |
 | Force-guided assembly: three components seated in housing pockets with 1.5 mm clearance | Stacking blocks is not an assembly; fit-up needs force sensing because position is only known to a few millimetres | `motion/insertion.py`, `cell/assembly.py`, `tests/test_assembly.py` |
 | Stacking releases at a known height and retreats straight up | The descent pushed the lower part away and the retreat dragged the upper one; stacking is still not reliable and has no check of its own | `core/robot.py` |
 | Pick descent stops exactly at the grasp height | It could overshoot by up to one 4 mm step | same |

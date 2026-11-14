@@ -79,19 +79,54 @@ git clone https://github.com/riskerfru/ai-robot-manipulation.git
 cd ai-robot-manipulation
 pip install -r requirements.txt
 
-python -m pytest -q                     # 86 tests, about 1 min
+python -m pytest -q                     # 108 tests, about 2 min
 python run_cell.py                      # two PLC jobs, headless, no API key
 python run_cell.py --scenario guard     # guard door opens mid-job
 python run_cell.py --gui                # watch it
 python eval_physics.py --orders 20      # the numbers above (about 35 min)
 ```
 
+## Mixed-case packing with a typed changeover
+
+A third cell layout (`scene="packing"`), modelled on an FMCG end-of-line
+cell. Cartons of tea wait on the infeed in two formats (standard 50 mm,
+travel 40 mm) and three flavours. A shelf-ready tray with locating nests
+sits on the conveyor, a few millimetres off its mark.
+
+1. The operator types an order, for example *"Pack a mixed case of standard
+   cartons: two lemon, one mint and one berry."*
+2. The language model reads it, with the SKU master and the stock, and
+   returns a small plan: which format, how many of each flavour. That is
+   its whole job. It never commands the robot.
+3. Code checks the plan: the format exists, the flavours are in stock, the
+   quantities fill the tray exactly. A wrong plan is sent back once with
+   the reasons, then refused.
+4. The robot seats each carton in a nest with 2 mm clearance per side by
+   force-guided insertion. The first carton finds where the tray really is;
+   the rest start from there and usually go straight in.
+5. A second order asks for the travel size. The tray pattern, carton size,
+   pick positions and grasp height all come from the SKU master
+   (`cell/packing.py`), so the changeover is a data change, not a program
+   change.
+
+```bash
+python record_demo.py packing             # one video of both orders (needs the API key and ffmpeg)
+python record_demo.py packing --offline   # same, planned by the built-in parser
+python run_packing.py --offline           # terminal run, no video
+python run_packing.py --gui               # with the simulator window
+```
+
+Simulation only. The force signal is read from the physics engine, the
+conveyor index is a scripted move, and nothing here has run on a packing
+line.
+
 ## Force-guided assembly
 
 A second cell layout (`scene="assembly"`): a housing with three pockets is
 fixed on the conveyor, and three supply stations each hold one component
 (50, 40 and 35 mm). Recipe 3 seats each component in its pocket, which
-leaves 1.5 mm per side.
+leaves 1.5 mm per side. In testing about three jobs in four complete; the
+rest end with a component reported as not seated (see `EVAL.md`).
 
 Position alone does not do this. The component's position in the gripper
 and the housing's position are each known only to a few millimetres, so
@@ -176,6 +211,7 @@ returns to READY after the guard is closed and the fault acknowledged.
 | Audit trail | `audit/` | Hash-chained JSON Lines; `python -m audit.trail <file>` verifies |
 | Robot backends | `hardware/` | PyBullet Panda; UR5e over RTDE (fake-tested only) |
 | Cell definition | `cell/` | Layout, scene builder, factory, visual dressing for recordings |
+| Packing cell | `cell/packing.py`, `packing_orders.py`, `run_packing.py` | SKU master, trays, order planner with validation, changeover |
 | Assembly cell | `cell/assembly.py`, `motion/insertion.py` | Housing with pockets, supply stations, force-guided insertion |
 | Demo recorder | `record_demo.py` | Headless video with a status panel driven by the audit trail |
 
