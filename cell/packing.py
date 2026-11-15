@@ -330,6 +330,10 @@ LINE_NOISE = {
 WIDTH_TOLERANCE = 0.0025       # gripper width check, +/- metres
 CAMERA_SIZE_TOLERANCE = 0.0035 # camera size check, +/- metres
 REJECT_BIN = [(0.36, 0.0), (0.46, 0.0)]
+# The bin lies in the empty band between the infeed rows (nearest
+# slot y = 0.14). A carton on the bin reaches about y = 0.072, so
+# this band holds the bin and nothing that is still stock.
+REJECT_ZONE_HALF_Y = 0.095
 REJECT_COLOUR = [0.86, 0.42, 0.42, 1.0]
 
 
@@ -468,7 +472,11 @@ class PackingLine:
             size = f["carton"]
             found, hidden = detector.detect(
                 colours, size, expect_size_m=size, area=area, image=image)
-            self.by_format[fmt] = found
+            # The reject bin sits in the gap between the two rows of
+            # infeed slots. Anything there has already been thrown
+            # out, so it is not stock and must not be picked again.
+            self.by_format[fmt] = [d for d in found
+                                   if abs(d.y) > REJECT_ZONE_HALF_Y]
             self.hidden.extend(hidden)
         self.detected = self.by_format.get(self.format, [])
         self.taken = []
