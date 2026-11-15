@@ -2,6 +2,8 @@
 # =============================================================
 #   RUN PACKING - the packing cell from the terminal
 #
+#   python run_packing.py --gui --interactive  a window, then type your
+#                                              own orders one by one
 #   python run_packing.py                      default scene and orders
 #   python run_packing.py --interactive        type orders one by one
 #   python run_packing.py --scene-file scenes/cosmetics.json --interactive
@@ -95,20 +97,40 @@ def main():
         return contextlib.redirect_stdout(io.StringIO() if quiet
                                           else sys.__stdout__)
 
+    from packing_orders import quiet_scan
     with hush():
         cell = build_packing_cell(args, gui=args.gui)
-        # Look at the cell once up front, so the stock shown before
-        # the first order is what the camera can actually see.
-        from packing_orders import quiet_scan
-        quiet_scan(cell)
     line = cell.robot.packing_line
     print("\n".join(P.describe_scene()))
     print(f"Planner: {label}")
     print("Conditions: " + ("clean" if args.clean else
                             f"real-line (seed {args.seed})"))
 
+    interactive = args.interactive or (not args.orders and args.scene)
+    if interactive:
+        # Nothing moves and nothing is looked at until you say so.
+        # With the simulator window open this is the moment to drag
+        # the cartons and the tray wherever you want them.
+        print("\nThe cell is set up. Move things around if you like,"
+              + (" then" if args.gui else ""))
+        print("type  start  and press Enter when you are ready.")
+        while True:
+            try:
+                first = input("ready> ").strip().lower()
+            except EOFError:
+                first = "start"
+            if first in ("start", "go", "begin", ""):
+                break
+            if first in ("quit", "exit", "q"):
+                cell.soft_plc.stop()
+                return 0
+            print("Type  start  to begin, or  quit  to stop.")
+
+    print("\nLooking at the cell with the overhead camera...")
+    with hush():
+        quiet_scan(cell)
+
     orders = list(args.orders)
-    interactive = args.interactive or (not orders and args.scene)
     if not orders and not interactive:
         orders = DEFAULT_ORDERS
     ok = True
