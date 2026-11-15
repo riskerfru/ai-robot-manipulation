@@ -1,0 +1,81 @@
+===============================================================
+  SCENES - running the cell on a different product
+===============================================================
+
+The robot is not programmed for tea cartons. It is programmed for
+"boxes of some size, in some colours, going into a tray". A scene
+file says which boxes, which colours and which tray. Change the
+file and the same code runs a different product line.
+
+    python run_robot.py --gui --scene-file scenes/cosmetics.json
+
+Three are included: tea.json, cosmetics.json, snacks.json.
+
+
+WRITING YOUR OWN
+----------------
+Copy one of them, rename it, and edit. Here is the whole thing,
+explained:
+
+{
+  "name": "Skincare gift sets",      <- shown on screen, any text
+  "item": "box",                     <- the word used when talking
+                                        to you ("carton", "box",
+                                        "pack", "tub")
+
+  "products": {                      <- what you are packing, and
+    "cream": [0.95, 0.86, 0.72],        the colour of each, as
+    "serum": [0.30, 0.55, 0.80],        red, green, blue from 0 to
+    "mask":  [0.80, 0.40, 0.55]         1. The camera finds items
+  },                                     by this colour, so make
+                                         them clearly different
+                                         from each other.
+
+  "formats": {                       <- the sizes you run. Each
+    "retail": {                         one has its own tray.
+      "size_mm": 45,                 <- the box edge, 35 to 55
+      "rows": 2, "cols": 2,          <- the tray pattern, up to
+                                        3 rows by 2 columns
+      "stock": {"cream": 3,          <- how many of each start on
+                "serum": 2,             the infeed for this size
+                "mask": 2}
+    },
+    "sample": {"size_mm": 35, "rows": 2, "cols": 2,
+               "stock": {"cream": 2, "serum": 2}}
+  },
+
+  "damaged_random": 1                <- how many items start out
+}                                       slightly swollen, so you
+                                        can watch the cell catch
+                                        and reject them. 0 for
+                                        none.
+
+
+THE LIMITS, AND WHY
+-------------------
+    size_mm must be 35 to 55
+        This gripper has been tested over that range. Outside it,
+        the scene is refused rather than attempted - a cell that
+        quietly tries something it cannot do is worse than one
+        that says no.
+
+    rows at most 3, cols at most 2
+        That is what fits on the tray within the arm's reach.
+
+    colours must be distinguishable
+        Two products in near-identical colours will confuse the
+        camera. If you write a scene like that, you will see it
+        mis-sort, which is honest - the camera really is doing the
+        work.
+
+If a scene breaks a rule, you get a message saying which rule and
+what you wrote. Nothing moves.
+
+
+WHAT STAYS THE SAME
+-------------------
+Everything else. The camera, the picking, the force-guided
+seating, the size checks, the reject logic, the safety gate, the
+audit trail, and the command interpreter. The model is briefed
+from whatever scene is loaded, so "bin the blue one" works on the
+cosmetics scene without a line of code changing.

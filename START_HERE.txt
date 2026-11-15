@@ -1,0 +1,80 @@
+===============================================================
+  ROBOT CELL - START HERE
+===============================================================
+
+STEP 1 - put your key in
+------------------------
+Open the file called  .env  in this folder with Notepad.
+Replace the words  PUT_YOUR_KEY_HERE  with your API key.
+Save and close. Never paste that key anywhere else.
+
+
+STEP 2 - install (once)
+-----------------------
+Open a terminal IN THIS FOLDER. Check you are in the right place:
+
+    dir                     (Windows)    or    ls    (Mac/Linux)
+
+You should see run_robot.py in the list. If you do not, you are in
+the wrong folder - go one level deeper and look again.
+
+Then:
+
+    pip install -r requirements.txt
+
+
+STEP 3 - talk to the robot
+--------------------------
+    python run_robot.py --gui
+
+A window opens. Nothing is moving. Type:
+
+    start
+
+Then type whatever you want:
+
+    put a green and a purple one in the tray
+    bin the yellow one
+    fill the tray, mostly berry
+    change over to the travel size and fill it
+    what can you see?
+
+Type  quit  to stop.
+
+Read COMMANDS.txt for what it can and cannot do.
+
+
+OTHER THINGS YOU CAN RUN
+------------------------
+    python run_robot.py --gui --seed 7
+        the same cell with the cartons laid out differently
+
+    python run_robot.py --gui --scene-file scenes/cosmetics.json
+        a completely different product set. SCENES.txt explains how
+        to write your own.
+
+    python run_packing.py --orders 2 --gui
+        the older mode: fixed packing orders, no typing
+
+    python run_packing.py --offline --gui
+        runs with no key and no model at all, for comparison
+
+    python record_demo.py --scenario packing
+        writes an MP4 to demo_out/ with no window
+
+
+IF SOMETHING GOES WRONG
+-----------------------
+"No such file or directory"
+    You are in the wrong folder. See STEP 2.
+
+"ANTHROPIC_API_KEY is not set"
+    The .env file is not filled in, or it is in a different folder
+    from the one you are running in.
+
+No window appears
+    You left off  --gui
+
+A command is refused
+    The reason is printed. It is usually that the camera cannot
+    see what you asked for, or the tray nest is already full.
