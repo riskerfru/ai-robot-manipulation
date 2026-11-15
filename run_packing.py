@@ -97,6 +97,10 @@ def main():
 
     with hush():
         cell = build_packing_cell(args, gui=args.gui)
+        # Look at the cell once up front, so the stock shown before
+        # the first order is what the camera can actually see.
+        from packing_orders import quiet_scan
+        quiet_scan(cell)
     line = cell.robot.packing_line
     print("\n".join(P.describe_scene()))
     print(f"Planner: {label}")
@@ -116,9 +120,11 @@ def main():
         elif interactive:
             stock = "; ".join(
                 f"{fmt}: " + ", ".join(f"{n} {k}" for k, n in
-                                       line.stock_levels(fmt).items())
+                                       line.stock_levels(fmt).items()
+                                       if n)
                 for fmt in P.FORMATS)
-            print(f"\nStock left: {stock}")
+            print(f"\nThe camera sees: {stock}")
+            print("Type an order, or 'quit' to stop.")
             try:
                 order = input("order> ").strip()
             except EOFError:
