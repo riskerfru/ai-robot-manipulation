@@ -27,6 +27,13 @@ What was tried, what the evidence was, and what was kept.
 | Placement tolerance tightened from 8 cm to 2 cm, set in `config.PLACEMENT` | 8 cm was hiding the placement error above | `config.py` |
 | Slot calibration measures against the commanded position, is applied on the first place, and ignores scattered errors | A corrected placement that landed on target was diluting the learned offset; random knocks were being learned as offsets | `tests/test_verifier_honesty.py` |
 | Stored `slot_calibration.json` removed from the repository | It held a 5 cm offset learned from stub runs and was loaded on every start | `.gitignore` |
+| Cartons are found by an overhead camera, not read from the simulator | The old `detect_objects` confirmed a part was visible and then returned the simulator's exact position, so nothing was really measured | `perception/detector.py`, `tests/test_packing.py` |
+| The robot picks at a measured position and grips whatever is there | A pick by name cannot fail the way a real one does | `core/robot.py`, `pick_at` |
+| The arm parks clear of the camera before each scan | From its usual pose it hid two cartons; they were reported as hidden rather than mislocated | `cell/packing.py` |
+| The carton's size comes from the image too | Gripping a bulged carton at the nominal height met it too low and pushed it aside | same |
+| A carton is rejected only when the camera and the gripper agree it is out of size | A single odd gripper reading was throwing away a good carton | same |
+| The wrist pose is held through the lift | Where the arm cannot keep the tool vertical, the wrist found its own way up and swung the part 12 mm in the grip | `core/robot.py` |
+| The audit trail copies what it is given | A caller that later changed a dict it had logged broke the hash chain | `audit/trail.py` |
 | Mixed-case packing cell with a typed format changeover | An FMCG use case: the model turns a typed order into a small plan, code validates it against the SKU master and stock, the robot packs it | `cell/packing.py`, `packing_orders.py`, `tests/test_packing.py` |
 | Parts the wrist camera is not set up for are picked from their reported position | The pick used wherever visual servoing gave up, up to 1 cm off, so parts sat off-centre in the gripper | `core/robot.py` |
 | Insertion travels to the pocket at a safe height before lowering | Arriving on a diagonal swept the held part through parts already in the fixture | `motion/insertion.py` |

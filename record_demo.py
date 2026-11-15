@@ -110,7 +110,7 @@ def wrap(text, width=44):
 def short(part):
     """'lemon_s1' -> 'lemon'; other names unchanged."""
     head, _, tail = part.partition("_")
-    return head if tail[:1] in ("s", "t") and tail[1:].isdigit() else part
+    return head if tail[:1].isalpha() and tail[1:].isdigit() else part
 
 
 def describe(subtask):
@@ -173,6 +173,12 @@ class Hud:
             self.tasks = []
             self.truth = None
             self.plan_line = ("planning...", MUTED)
+        elif name == "scan":
+            seen = ", ".join(f"{n} {c}" for n, c in d["stock"].items() if c)
+            self.event(f"Camera: {len(d['found'])} found"
+                       + (f", {d['hidden']} hidden" if d["hidden"] else ""),
+                       BLUE)
+            self.measure = (f"Seen on the infeed: {seen}", BLUE)
         elif name == "order_plan":
             items = ", ".join(f"{q} {f}" for f, q in d["items"])
             self.plan_line = (f"Plan: {d['format']} tray, {items}", GREEN)
@@ -184,6 +190,18 @@ class Hud:
             self.cell_state = "READY"
             self.measure = (d["reason"][:52], RED)
             self.event(f"REFUSED: {d['reason'][:34]}", RED)
+        elif name == "part_rejected":
+            self.measure = (f"{d['flavour']} REJECTED: {d['width_mm']} mm "
+                            f"wide, nominal {d['nominal_mm']:g}", RED)
+            self.event(f"Size check: {d['flavour']} {d['width_mm']} mm "
+                       f"in the grip, {d.get('seen_mm', '?')} mm seen",
+                       RED)
+            self.event("Replacement taken from stock" if d["substitute"]
+                       else "No replacement in stock", AMBER)
+            for task in self.tasks:
+                if task[1] == "current":
+                    task[1] = "pending"       # same nest, next carton
+                    break
         elif name == "changeover":
             self.event(f"Changeover {d['from_format']} to {d['to_format']}: "
                        f"{d['carton_mm']} mm", AMBER)
@@ -500,11 +518,11 @@ class Recorder:
 # ---- cell set-up ---------------------------------------------
 
 def make_cell(rec, hud, llm=False, scene="dispatch",
-              housing_offset=(0.0, 0.0)):
+              housing_offset=(0.0, 0.0), **cell_options):
     """Build a cell and connect it to the recorder and the panel."""
     with contextlib.redirect_stdout(io.StringIO()):
         cell = build_sim_cell(NullLogger(), llm_enabled=llm, scene=scene,
-                              housing_offset=housing_offset)
+                              housing_offset=housing_offset, **cell_options)
     cell.dressing = CellDressing(cell.robot)
     cell.housing_offset = housing_offset
     if scene in ("assembly", "packing"):
@@ -820,20 +838,38 @@ def scenario_assembly_compare(rec, offset_mm=(3.0, 2.5)):
     cell.soft_plc.stop()
 
 
-def scenario_packing(rec, orders, offline=False):
+def scenario_packing(rec, orders, args):
     """Typed orders, a planned case, force-guided packing, a changeover."""
+    from cell import packing as P
     from packing_orders import make_planner, run_order
-    planner, label = make_planner(offline)
+    try:
+        P.load_scene(args.scene_file)
+    except P.SceneError as exc:
+        sys.exit(f"Scene refused: {exc}")
+    planner, label = make_planner(args.offline)
+    noise = None if args.clean else P.LINE_NOISE
     hud = Hud("Mixed-case packing",
               "Typed order, planned case, force-guided packing",
               f"Planner: {label}")
     hud.show_guard = False
     cell = make_cell(rec, hud, scene="packing",
-                     housing_offset=(0.002, -0.0015))
-    hud.measure = ("No carton packed yet", MUTED)
+                     packing_scene=args.scene_file, seed=args.seed,
+                     line_noise=noise)
+    hud.measure = ("Nothing packed yet", MUTED)
+    item = P.SCENE["item"]
+
+    conditions = ([f"{item.capitalize()}s lie up to 5 mm off their marks, "
+                   f"slightly turned.",
+                   "Each tray stops up to 3 mm from its mark.",
+                   "Some stock may be damaged.",
+                   "The robot is told none of this: it finds every "
+                   f"{item} with its overhead camera."] if noise else
+                  ["Clean run: everything exactly on its mark."])
+    rec.card(P.SCENE["name"], conditions + [f"Seed {args.seed}. Simulation."],
+             seconds=5.0)
     rec.hold(1.5)
 
-    seated = total = 0
+    seated = planned = rejected = 0
     refused = []
     for number, order in enumerate(orders):
         lines = wrap(order, 56)
@@ -843,7 +879,6 @@ def scenario_packing(rec, orders, offline=False):
                  else "The operator types the next order", lines,
                  seconds=4.0)
         hud.on_audit("order_text", {"order": order})
-        hud.cell_state = "READY" if number == 0 else hud.cell_state
         rec.hold(1.0)
         out = quiet(run_order, cell, order, planner, tray_number=number)
         if "refused" in out:
@@ -855,17 +890,21 @@ def scenario_packing(rec, orders, offline=False):
                       else f"NOT seated ({c['gap_mm']:.0f} mm up)",
                       c["seated"]) for c in out["check"]]
         seated += sum(c["seated"] for c in out["check"])
-        total += len(out["check"])
+        planned += out["planned"]
+        rejected += len(out["rejected"])
         rec.hold(5.0)
 
-    lines = [f"{seated} of {total} cartons seated in nests with 2 mm clearance.",
-             "Each tray sat a few millimetres off its mark; the robot was "
-             "not told.",
-             "The format change came from a typed order and the SKU master."]
-    if refused:
-        lines.append(f"{len(refused)} order(s) refused: {refused[0][:60]}")
-    lines.append(f"Planner: {label}. Simulation.")
-    rec.card("Result", lines, seconds=6.0)
+    lines = [f"{seated} of {planned} {item}s seated in nests with 2 mm "
+             f"clearance."]
+    if rejected:
+        lines.append(f"{rejected} damaged {item}(s) caught by the gripper "
+                     f"width check and rejected.")
+    for reason in refused[:2]:
+        lines.append(f"Refused: {reason[:62]}")
+    lines.append(f"Planner: {label}.")
+    lines.append("Simulation. Disturbances are injected by the scene, "
+                 f"seed {args.seed}.")
+    rec.card("Result", lines, seconds=7.0)
     cell.soft_plc.stop()
 
 
@@ -910,6 +949,13 @@ def main():
     ap.add_argument("--offline", action="store_true",
                     help="packing: plan with the built-in parser instead "
                          "of the language model")
+    ap.add_argument("--scene-file", default=None,
+                    help="packing: scene file (JSON); default is tea")
+    ap.add_argument("--seed", type=int, default=0,
+                    help="packing: changes carton positions, tray offsets "
+                         "and random damage")
+    ap.add_argument("--clean", action="store_true",
+                    help="packing: no scatter, sensor error or damage")
     ap.add_argument("--scene", default="dispatch",
                     choices=["dispatch", "assembly"],
                     help="cell used by the 'order' scenario")
@@ -931,9 +977,10 @@ def main():
         elif args.scenario == "assembly-compare":
             scenario_assembly_compare(rec)
         elif args.scenario == "packing":
-            from run_packing import ORDER_1, ORDER_2
-            scenario_packing(rec, args.orders or [ORDER_1, ORDER_2],
-                             args.offline)
+            from run_packing import DEFAULT_ORDERS
+            if args.scene_file and not args.orders:
+                sys.exit("--orders is needed with --scene-file")
+            scenario_packing(rec, args.orders or DEFAULT_ORDERS, args)
         else:
             scenario_order(rec, args.text, args.scene)
     finally:

@@ -945,37 +945,112 @@ class WarehouseAgent:
 
             # ──────────────────────────────────────────
             elif action == "insert":
-                obj = (params.get("object") or params.get("item")
-                       or current_subtask.get("object", ""))
-                pocket = getattr(self.robot, "pockets", {}).get(obj)
-                if not obj or pocket is None:
-                    return {"action": "insert", "status": "failed",
-                            "detail": f"no pocket defined for '{obj}'"}
+                spec = current_subtask or {}
+                pick = spec.get("pick")
+                pocket = spec.get("pocket")
 
-                if self.robot.grasped_object not in (None, obj):
+                if pick is None:
+                    # Named part (assembly cell): the pocket comes from
+                    # the cell's fixture map.
+                    obj = (params.get("object") or params.get("item")
+                           or spec.get("object", ""))
+                    pocket = getattr(self.robot, "pockets", {}).get(obj)
+                    if not obj or pocket is None:
+                        return {"action": "insert", "status": "failed",
+                                "detail": f"no pocket defined for '{obj}'"}
+                else:
+                    obj = spec.get("product", "part")
+
+                if (pick is None and self.robot.grasped_object
+                        not in (None, obj)):
                     return {"action": "insert", "status": "failed",
                             "detail": f"holding "
-                                      f"{self.robot.grasped_object}, not {obj}"}
-                if self.robot.grasped_object != obj:
+                                      f"{self.robot.grasped_object}, "
+                                      f"not {obj}"}
+
+                if pick is not None:
+                    # Camera-driven: go to a measured position and grip
+                    # whatever is there.
+                    if self.robot.grasped_object is None:
+                        picked = self.robot.pick_at(
+                            pick["x"], pick["y"], pick["centre_z"],
+                            finger_axis=pick.get("finger_axis"),
+                            open_to=pick.get("open_to"),
+                            grasp_depth=pick.get("grasp_depth"),
+                            label=obj)
+                        if picked.get("status") != "success":
+                            return {"action": "insert", "status": "failed",
+                                    "target": obj,
+                                    "detail": picked.get("detail",
+                                                         "pick failed")}
+                    held = self.robot.grasped_object
+                    self.audit.log("picked", product=obj,
+                                   at=[round(pick["x"], 4),
+                                       round(pick["y"], 4)],
+                                   gripped=held)
+                elif self.robot.grasped_object != obj:
+                    # A part left in its fixture by a failed attempt is
+                    # re-gripped with the fingers opened only as far as
+                    # the fixture allows, not swung wide into neighbours.
+                    hints = getattr(self.robot, "pick_hints", {}).get(obj)
+                    if hints is not None and pocket.get("release_open"):
+                        at = self.robot.get_object_position(obj)
+                        in_fixture = (at and abs(at[0] - pocket["x"]) < 0.03
+                                      and abs(at[1] - pocket["y"]) < 0.03)
+                        hints["open_to"] = (pocket["release_open"]
+                                            if in_fixture
+                                            else hints.get("station_open"))
                     picked = self.robot.pick_object(obj)
                     if not (isinstance(picked, dict)
                             and picked.get("status") == "success"):
                         return {"action": "insert", "status": "failed",
+                                "target": obj,
                                 "detail": (picked.get("detail")
                                            if isinstance(picked, dict)
                                            else f"could not pick {obj}")}
+                held = self.robot.grasped_object or obj
 
-                result = self.robot.insert_part(obj, pocket)
-                self.audit.log("insertion", part=obj, result=result)
+                # Quality gate with the part in the gripper (packing:
+                # carton width from the finger positions).
+                gate = getattr(self.robot, "part_gate", None)
+                verdict = gate(held, spec.get("nest")) if gate else None
+                if verdict:
+                    self.robot.place_object(*verdict["reject_to"])
+                    self.audit.log("part_rejected", **{
+                        k: v for k, v in verdict.items()
+                        if k != "substitute"},
+                        substitute=bool(verdict.get("substitute")))
+                    sub = verdict.get("substitute")
+                    print(f"  [REJECT] {held}: {verdict['width_mm']} mm "
+                          f"wide, nominal {verdict['nominal_mm']} mm")
+                    if sub and pick is not None:
+                        current_subtask["pick"] = sub
+                    elif sub:
+                        current_subtask["object"] = sub
+                    return {"action": "insert", "status": "failed",
+                            "target": obj,
+                            "detail": (f"'{held}' rejected: "
+                                       f"{verdict['width_mm']} mm wide, "
+                                       f"nominal {verdict['nominal_mm']} mm; "
+                                       + ("replacement from the scan" if sub
+                                          else "no replacement in stock"))}
+
+                result = self.robot.insert_part(held, pocket)
+                self.audit.log("insertion", part=obj, gripped=held,
+                               nest=spec.get("nest"), result=result)
                 print(f"  [INSERT] {result.get('detail')}")
 
-                if (result.get("status") != "success"
-                        and self.robot.grasped_object == obj):
+                if result.get("status") == "success":
+                    record = getattr(self.robot, "packing_line", None)
+                    if record is not None and spec.get("nest"):
+                        record.record_gripped(spec["nest"], held)
+                elif self.robot.grasped_object == held:
                     # Not seated and still in the gripper: put it back
-                    # on its station so a retry starts from a fresh grasp.
-                    station = getattr(self.robot, "stations", {}).get(obj)
-                    if station:
-                        self.robot.place_object(*station)
+                    # where it came from so a retry starts fresh.
+                    home = (getattr(self.robot, "stations", {}).get(held)
+                            or (pick["x"], pick["y"]) if pick else None)
+                    if home:
+                        self.robot.place_object(*home)
                 return {
                     "action": "insert",
                     "status": result.get("status", "failed"),

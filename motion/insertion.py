@@ -26,6 +26,7 @@ STEP_M         = 0.001    # descent step
 SEARCH_STEP_M  = 0.001    # spiral pitch
 SEARCH_MAX_M   = 0.007    # largest search radius
 SEATED_TOL_M   = 0.002    # part base within this of the pocket floor
+FINGERTIP_BELOW_TCP = 0.011   # closed fingertips below the gripper point
 
 
 class ForceGuidedInsertion:
@@ -153,7 +154,7 @@ class ForceGuidedInsertion:
 
         def seated(z_now):
             """Deep enough that the part must be on the pocket floor."""
-            return z_now <= seat_z + 0.0025
+            return z_now <= seat_z + pocket.get("depth_tol", 0.0025)
 
         z, f = lower_until_contact(x, y, rim_z + 0.03, floor_cmd)
 
@@ -205,9 +206,19 @@ class ForceGuidedInsertion:
         self._release(part, pocket.get("release_open"))
         r._retreat_straight_up(orn)
 
+        tol = pocket.get("seated_tol", SEATED_TOL_M)
         pos = r.get_object_position(part)
         base_err = (pos[2] - pocket["half"]) - pocket["floor_z"]
-        seated = abs(base_err) <= SEATED_TOL_M
+        tamped = False
+        if tol < base_err < 0.006 and pocket.get("tamp"):
+            # In the nest but riding high on a wall: press it home from
+            # above with the closed gripper, under the force limit.
+            tamped = True
+            peak = max(peak, self._tamp(part, pocket, x + offset[0],
+                                        y + offset[1], orn, read))
+            pos = r.get_object_position(part)
+            base_err = (pos[2] - pocket["half"]) - pocket["floor_z"]
+        seated = abs(base_err) <= tol
         result = {
             "status": "success" if seated else "failed",
             "action": "insert", "target": part,
@@ -216,6 +227,7 @@ class ForceGuidedInsertion:
             "searched": searched,
             "search_offset_mm": round(1000 * math.hypot(*offset), 1),
             "search_offset_xy": (round(offset[0], 5), round(offset[1], 5)),
+            "tamped": tamped,
             "detail": (f"'{part}' seated ({base_err * 1000:+.1f} mm), "
                        f"peak {peak:.0f} N"
                        + (f", found by search {1000 * math.hypot(*offset):.0f} mm"
@@ -225,6 +237,27 @@ class ForceGuidedInsertion:
                        f"above the pocket floor"),
         }
         return result
+
+    def _tamp(self, part, pocket, x, y, orn, read):
+        """Press a released part down with the closed fingertips."""
+        r = self.robot
+        r.close_gripper()
+        top = pocket["floor_z"] + 2 * pocket["half"]
+        z = top + FINGERTIP_BELOW_TCP + 0.012
+        self._move(x, y, z + 0.03, orn, speed=0.15)
+        self._move(x, y, z, orn, speed=0.1)
+        peak = 0.0
+        stop = top + FINGERTIP_BELOW_TCP - 0.0015
+        while z > stop:
+            z -= STEP_M / 2
+            self._move(x, y, z, orn)
+            f = read(z)
+            peak = max(peak, f)
+            if f > PRESS_LIMIT_N:
+                break
+        self._move(x, y, z + 0.04, orn, speed=0.1)
+        r.open_gripper(pocket.get("release_open"))
+        return peak
 
     def _release(self, part, open_to=None):
         r = self.robot

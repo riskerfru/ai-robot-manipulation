@@ -151,6 +151,20 @@ CAMERA = {
     "far": 10.0
 }
 
+# Overhead camera for the packing and assembly cells: directly above
+# the work area, so parts are seen from straight on. Off to one side
+# the camera sees a part's sides as well as its top, which pulls the
+# blob centre outwards and biases the measured position.
+CELL_CAMERA = {
+    "width": 1024,
+    "height": 1024,
+    "fov": 42,
+    "position": [0.48, 0.0, 1.45],
+    "target": [0.48, 0.0, 0.10],
+    "near": 0.1,
+    "far": 10.0
+}
+
 # --------------------------------------------------------------
 # AI SETTINGS
 # --------------------------------------------------------------

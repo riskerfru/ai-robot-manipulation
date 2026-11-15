@@ -27,12 +27,17 @@ class CameraSystem:
 
         self.logger.info("Camera System initialized")
 
-    def setup_overhead_camera(self):
-        """Setup overhead camera looking straight down"""
+    def setup_overhead_camera(self, config=None, name="overhead"):
+        """
+        Set up a camera looking straight down. A config of its own
+        can be given (the cell camera sits above the work area and
+        has its own resolution and field of view).
+        """
         import pybullet as p
 
-        eye    = self.config["position"]
-        target = self.config["target"]
+        config = config or self.config
+        eye    = config["position"]
+        target = config["target"]
 
         view_matrix = p.computeViewMatrix(
             cameraEyePosition=eye,
@@ -40,18 +45,21 @@ class CameraSystem:
             cameraUpVector=[0, 1, 0]
         )
         projection_matrix = p.computeProjectionMatrixFOV(
-            fov=self.fov,
-            aspect=self.width / self.height,
-            nearVal=self.near,
-            farVal=self.far
+            fov=config.get("fov", self.fov),
+            aspect=config.get("width", self.width)
+                   / config.get("height", self.height),
+            nearVal=config.get("near", self.near),
+            farVal=config.get("far", self.far)
         )
-        self.cameras["overhead"] = {
+        self.cameras[name] = {
             "view": view_matrix,
             "projection": projection_matrix,
             "position": eye,
-            "target": target
+            "target": target,
+            "width": config.get("width", self.width),
+            "height": config.get("height", self.height)
         }
-        self.logger.info(f"Overhead camera setup at {eye}")
+        self.logger.info(f"Camera '{name}' setup at {eye}")
 
     def setup_side_camera(self, position=[1.5, 0, 1.0], target=[0, 0, 0.3]):
         """Setup a side view camera"""

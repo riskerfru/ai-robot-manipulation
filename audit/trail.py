@@ -14,6 +14,7 @@
 # =============================================================
 
 import hashlib
+import copy
 import json
 import os
 import threading
@@ -54,6 +55,10 @@ class AuditTrail:
 
     def log(self, event, **payload):
         with self._lock:
+            # Copy what we are given: a caller that goes on to change
+            # a dict it passed in would otherwise alter a record that
+            # has already been hashed, and break the chain.
+            payload = copy.deepcopy(payload)
             record = {
                 "seq": self._seq,
                 "ts": datetime.now(timezone.utc).isoformat(

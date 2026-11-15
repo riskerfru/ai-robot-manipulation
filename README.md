@@ -79,7 +79,7 @@ git clone https://github.com/riskerfru/ai-robot-manipulation.git
 cd ai-robot-manipulation
 pip install -r requirements.txt
 
-python -m pytest -q                     # 108 tests, about 2 min
+python -m pytest -q                     # 112 tests, about 3 min
 python run_cell.py                      # two PLC jobs, headless, no API key
 python run_cell.py --scenario guard     # guard door opens mid-job
 python run_cell.py --gui                # watch it
@@ -88,6 +88,27 @@ python eval_physics.py --orders 20      # the numbers above (about 35 min)
 
 ## Mixed-case packing with a typed changeover
 
+**The robot is told nothing about where things are.** An overhead
+camera takes one image of the cell, `perception/detector.py` finds the
+cartons as coloured regions in the pixels, and each region's position
+comes from the camera's own geometry: the pixel defines a ray, and the
+ray is met with the plane the carton's top face lies on. Nothing reads
+a position out of the simulator.
+
+That means the measurements carry real error. Against the simulator's
+truth, measured afterwards and never fed back, cartons come out within
+0.5 to 1.5 mm. The same image separates the two formats by apparent
+size, and the robot arm itself is parked clear of the camera before
+each scan, because from where it usually sits it hides part of the
+infeed. A carton that is still partly hidden is reported as hidden
+rather than given a position that would be wrong.
+
+The pick follows from that: the robot goes to a measured position and
+grips whatever is there. Which body it caught is decided by the
+contact between its fingers and the part, not by a name. So a carton
+that is not where the camera thought is a pick that fails, as on a
+real cell.
+
 A third cell layout (`scene="packing"`), modelled on an FMCG end-of-line
 cell. Cartons of tea wait on the infeed in two formats (standard 50 mm,
 travel 40 mm) and three flavours. A shelf-ready tray with locating nests
@@ -95,15 +116,20 @@ sits on the conveyor, a few millimetres off its mark.
 
 1. The operator types an order, for example *"Pack a mixed case of standard
    cartons: two lemon, one mint and one berry."*
-2. The language model reads it, with the SKU master and the stock, and
-   returns a small plan: which format, how many of each flavour. That is
-   its whole job. It never commands the robot.
+2. The language model reads it, with the SKU master and the stock the
+   camera just counted, and returns a small plan: which format, how many
+   of each product. That is its whole job. It never commands the robot.
 3. Code checks the plan: the format exists, the flavours are in stock, the
    quantities fill the tray exactly. A wrong plan is sent back once with
    the reasons, then refused.
-4. The robot seats each carton in a nest with 2 mm clearance per side by
-   force-guided insertion. The first carton finds where the tray really is;
-   the rest start from there and usually go straight in.
+4. The robot picks each carton at the position the camera measured and
+   seats it in a nest with 2 mm clearance per side by force-guided
+   insertion. The first carton finds where the tray really is; the rest
+   start from there and usually go straight in.
+5. A carton that is out of size is caught in the gripper and rejected.
+   The camera's view of it and the gripper's own opening both have to
+   say it is wrong, so one odd reading does not throw away a good
+   carton. Another carton from the scan takes its nest.
 5. A second order asks for the travel size. The tray pattern, carton size,
    pick positions and grasp height all come from the SKU master
    (`cell/packing.py`), so the changeover is a data change, not a program
@@ -118,7 +144,14 @@ python run_packing.py --gui               # with the simulator window
 
 Simulation only. The force signal is read from the physics engine, the
 conveyor index is a scripted move, and nothing here has run on a packing
-line.
+line. The camera is a simulated one, so the lighting is perfect and the
+colours are exact; a real cell needs colour calibration and would see
+shadows, gloss and overlapping cartons.
+
+Over six runs of the two orders above, with cartons scattered on the
+infeed and the trays off their marks (random per seed, and not told to
+the controller), 54 of 60 cartons were seated and the damaged carton was
+caught and replaced every time, with no good carton wrongly rejected.
 
 ## Force-guided assembly
 
@@ -212,6 +245,7 @@ returns to READY after the guard is closed and the fault acknowledged.
 | Robot backends | `hardware/` | PyBullet Panda; UR5e over RTDE (fake-tested only) |
 | Cell definition | `cell/` | Layout, scene builder, factory, visual dressing for recordings |
 | Packing cell | `cell/packing.py`, `packing_orders.py`, `run_packing.py` | SKU master, trays, order planner with validation, changeover |
+| Overhead detection | `perception/detector.py` | Colour regions in the image, positions from the camera geometry |
 | Assembly cell | `cell/assembly.py`, `motion/insertion.py` | Housing with pockets, supply stations, force-guided insertion |
 | Demo recorder | `record_demo.py` | Headless video with a status panel driven by the audit trail |
 

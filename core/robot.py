@@ -11,6 +11,7 @@
 # =============================================================
 
 import math
+import random
 import pybullet as p
 import pybullet_data
 import time
@@ -42,6 +43,13 @@ class FrankaPandaRobot:
         self.pocket_bias   = (0.0, 0.0)   # learned fixture offset (x, y)
         self.pocket_bias_samples = []
         self.use_pocket_bias = False      # packing cell turns this on
+        self.perception_noise = 0.0       # sensor error, metres (1 sigma)
+        self._perception_error = {}
+        self.noise_rng     = random.Random(0)
+        self.last_grip_width = None       # metres, set at each grasp
+        self.part_gate     = None         # optional check after a pick
+        self.pick_hints    = {}           # name -> finger_axis, open_to
+        self._approach_finger_axis = None
         self.pockets       = {}       # part name -> nominal pocket
         self.stations      = {}       # part name -> supply station (x, y)
         self.logger        = logger
@@ -267,7 +275,7 @@ class FrankaPandaRobot:
     # ----------------------------------------------------------
 
     def add_object(self, name, x, y, color, z=0.05, half_extent=0.025,
-                   grasp_depth=None, vision=True):
+                   grasp_depth=None, vision=True, friction=1.5):
         col    = p.createCollisionShape(
             p.GEOM_BOX, halfExtents=[half_extent] * 3
         )
@@ -286,7 +294,7 @@ class FrankaPandaRobot:
         # FIX: High friction on objects - grip table surface firmly
         p.changeDynamics(
             obj_id, -1,
-            lateralFriction  = 1.5,
+            lateralFriction  = friction,
             spinningFriction = 0.05,
             rollingFriction  = 0.05
         )
@@ -612,7 +620,7 @@ class FrankaPandaRobot:
 
         # Fast approach to just above expected contact
         approach_z = max(min_z + 0.10, start_z - 0.30)
-        orn = self._down_orientation()
+        orn = self._down_orientation(self._approach_finger_axis)
         self._tool_orn = orn
         self._direct_move(x, y, approach_z, speed_factor=0.15, orn=orn)
 
@@ -728,11 +736,11 @@ class FrankaPandaRobot:
         print(f"  [DESCENT] Reached min z={current_z:.3f}m")
         return current_z
 
-    def _check_grasp_success(self, name, pre_z):
+    def _check_grasp_success(self, name, pre_z, orn=None):
         """Lift slightly and confirm the part came up with the gripper."""
         ee = self.get_end_effector_position()
-        self._direct_move(ee[0], ee[1], ee[2]+0.05, speed_factor=0.1,
-                          orn=self._tool_orn)
+        self._direct_move(ee[0], ee[1], ee[2]+0.05, speed_factor=0.05,
+                          orn=orn if orn is not None else self._tool_orn)
         for _ in range(40):
             p.stepSimulation()
             time.sleep(self.sim_config["timestep"])
@@ -747,8 +755,246 @@ class FrankaPandaRobot:
         print(f"  [GRASP] Object did not lift - grasp failed")
         return False
 
-    def pick_object(self, name):
+    def _complete_grasp(self, name):
+        """
+        Attach, check and lift whatever the fingers have closed
+        on. Shared by pick_object (by name) and pick_at (by a
+        measured position).
+        """
         pos = self.get_object_position(name)
+        # Hold whatever wrist pose the grasp was made with for the
+        # whole lift. Where the arm could not keep the tool vertical,
+        # self._tool_orn is None and letting the wrist find its own
+        # way up swings the part by a centimetre.
+        hold_orn = self._tool_orn or p.getLinkState(
+            self.robot, self.end_effector)[1]
+        # Attach the part exactly where it sits in the gripper.
+        # The constraint frame on the part is the gripper link pose
+        # expressed in the part's own frame, so the part keeps its
+        # grasp-time position and orientation and is not pulled
+        # sideways or twisted when the constraint engages.
+        obj_id   = self.objects[name]["id"]
+        obj_pos2 = self.get_object_position(name)
+
+        # A grasp only counts if the part is between the fingers.
+        ee_pos2 = self.get_end_effector_position()
+        miss = math.hypot(obj_pos2[0] - ee_pos2[0],
+                          obj_pos2[1] - ee_pos2[1])
+        if abs(obj_pos2[2] - ee_pos2[2]) > self.GRASP_CAPTURE_HEIGHT:
+            miss = max(miss, abs(obj_pos2[2] - ee_pos2[2]))
+        if miss > self.GRASP_CAPTURE_RADIUS:
+            print(f"  [PICK] ❌ Part is {miss*100:.1f}cm from the gripper "
+                  f"centre — not gripped")
+            self.open_gripper()
+            self._direct_move(ee_pos2[0], ee_pos2[1], ee_pos2[2] + 0.25,
+                              speed_factor=0.3)
+            self._sync_obstacles()
+            return {
+                "status": "failed", "action": "pick", "target": name,
+                "detail": f"grasp failed - '{name}' is {miss*100:.1f}cm "
+                          f"from the gripper centre"
+            }
+
+        link     = p.getLinkState(self.robot, self.end_effector)
+        part_pos, part_orn = p.getBasePositionAndOrientation(obj_id)
+        inv_pos, inv_orn   = p.invertTransform(part_pos, part_orn)
+        child_pos, child_orn = p.multiplyTransforms(
+            inv_pos, inv_orn, link[0], link[1]
+        )
+
+        self.grasp_constraint = p.createConstraint(
+            parentBodyUniqueId     = self.robot,
+            parentLinkIndex        = self.end_effector,
+            childBodyUniqueId      = obj_id,
+            childLinkIndex         = -1,
+            jointType              = p.JOINT_FIXED,
+            jointAxis              = [0, 0, 0],
+            parentFramePosition    = [0, 0, 0],
+            childFramePosition     = child_pos,
+            parentFrameOrientation = [0, 0, 0, 1],
+            childFrameOrientation  = child_orn
+        )
+        # Parts that are force-fitted must not slip in the grip when
+        # they meet a rim: the insertion judges depth from the gripper.
+        grip_n = 50 if self.objects[name].get("vision", True) else 200
+        p.changeConstraint(self.grasp_constraint, maxForce=grip_n)
+        # Width of what is in the gripper, from the finger positions.
+        self.last_grip_width = sum(
+            p.getJointState(self.robot, j)[0] for j in self.finger_joints)
+        self.grasped_object         = name
+        self.rrt.carrying_clearance = 0.04
+
+        # Verify grasp by lifting slightly
+        pre_z   = obj_pos2[2]
+        grasped = self._check_grasp_success(name, pre_z, orn=hold_orn)
+        if not grasped:
+            p.removeConstraint(self.grasp_constraint)
+            self.grasp_constraint   = None
+            self.grasped_object     = None
+            self.rrt.carrying_clearance = 0
+            self.open_gripper()
+            return {
+                "status": "failed", "action": "pick",
+                "target": name,
+                "detail": "grasp failed - object did not lift"
+            }
+
+        print(f"  [PICK] Lifting '{name}'...")
+        # Rise in small steps with the sideways position corrected:
+        # a fast lift drags the part within the grip.
+        ee_up = self.get_end_effector_position()
+        for rise in (0.01, 0.025, 0.05, 0.09, 0.15):
+            for _ in range(2):
+                self._direct_move(ee_up[0], ee_up[1], ee_up[2] + rise,
+                                  speed_factor=0.05, orn=hold_orn)
+                now = self.get_end_effector_position()
+                if math.hypot(ee_up[0] - now[0], ee_up[1] - now[1]) < 0.0008:
+                    break
+        # Hold the tool square on the way up too: letting the wrist
+        # turn here swings the part in the grip by a centimetre.
+        self._direct_move(ee_up[0], ee_up[1], pos[2]+0.40,
+                          speed_factor=0.15, orn=hold_orn)
+        self._sync_obstacles()
+
+        lifted = self.get_object_position(name)
+        if lifted and lifted[2] < pos[2] + 0.15:
+            print(f"  [PICK] ⚠️  Grasp failed — object did not lift")
+            if self.grasp_constraint:
+                p.removeConstraint(self.grasp_constraint)
+                self.grasp_constraint = None
+            self.grasped_object         = None
+            self.rrt.carrying_clearance = 0
+            return {
+                "status": "failed", "action": "pick", "target": name,
+                "detail": "grasp failed — object did not lift"
+            }
+
+        self.logger.success(f"Picked '{name}'!")
+        return {
+            "status": "success", "action": "pick", "target": name,
+            "position": list(pos),
+            "detail": (f"picked {name} from "
+                       f"({pos[0]:.2f},{pos[1]:.2f},{pos[2]:.2f})")
+        }
+
+    def pick_at(self, x, y, centre_z, finger_axis=None, open_to=None,
+                grasp_depth=None, label="part"):
+        """
+        Pick whatever is at a measured position. No part name is used:
+        the position comes from the camera, and which body ends up in
+        the gripper is decided by what the fingers actually close on.
+
+        x, y      measured centre of the part
+        centre_z  height of the part's centre (its size is known from
+                  the product being run, so this follows from the
+                  measured top face)
+        Returns a result dict with "gripped": the body's name, or a
+        failure if the fingers closed on nothing.
+        """
+        if self.grasped_object:
+            return {"status": "failed", "action": "pick", "target": label,
+                    "detail": f"gripper is not empty "
+                              f"(holding '{self.grasped_object}')"}
+
+        self._sync_obstacles()
+        self._approach_finger_axis = finger_axis
+        self.open_gripper(open_to)
+        for _ in range(50):
+            p.stepSimulation()
+            time.sleep(self.sim_config["timestep"])
+
+        print(f"\n  [PICK] Approaching {label} at "
+              f"({x:.3f}, {y:.3f}) from the camera...")
+        if not self.move_to_position(x, y, centre_z + 0.40, use_rrt=True):
+            self._sync_obstacles()
+            return {"status": "failed", "action": "pick", "target": label,
+                    "detail": f"cannot reach above ({x:.3f}, {y:.3f})"}
+
+        self._direct_move(x, y, self.get_end_effector_position()[2],
+                          speed_factor=0.3)
+        print(f"  [PICK] Descending to contact...")
+        depth = self.GRASP_DEPTH if grasp_depth is None else grasp_depth
+        self._descend_until_contact(
+            x, y, start_z=self.get_end_effector_position()[2],
+            torque_threshold=8.0, step_size=0.004, floor_z=centre_z - depth)
+
+        print(f"  [PICK] Gripping...")
+        self.close_gripper()
+        for _ in range(60):
+            p.stepSimulation()
+            time.sleep(self.sim_config["timestep"])
+
+        name = self._body_in_gripper()
+        if name is None:
+            print(f"  [PICK] ❌ Nothing in the gripper")
+            self.open_gripper()
+            ee = self.get_end_effector_position()
+            self._direct_move(ee[0], ee[1], ee[2] + 0.25, speed_factor=0.3)
+            self._sync_obstacles()
+            return {"status": "failed", "action": "pick", "target": label,
+                    "detail": f"the fingers closed on nothing at "
+                              f"({x:.3f}, {y:.3f})"}
+
+        result = self._complete_grasp(name)
+        if isinstance(result, dict) and result.get("status") == "success":
+            result["gripped"] = name
+        return result
+
+    def _body_in_gripper(self):
+        """
+        Which body the fingers have closed on, from contact alone.
+        A part counts only if both fingers are touching it.
+        """
+        touching = []
+        for joint in self.finger_joints:
+            bodies = set()
+            for contact in p.getContactPoints(bodyA=self.robot,
+                                              linkIndexA=joint):
+                if contact[2] != self.robot:
+                    bodies.add(contact[2])
+            touching.append(bodies)
+        if not touching:
+            return None
+        both = set.intersection(*touching) if len(touching) > 1 \
+            else touching[0]
+        if not both:
+            return None
+        ee = self.get_end_effector_position()
+        best, best_distance = None, 1e9
+        for body in both:
+            name = next((n for n, data in self.objects.items()
+                         if data["id"] == body), None)
+            if name is None:
+                continue
+            pos, _ = p.getBasePositionAndOrientation(body)
+            distance = math.hypot(pos[0] - ee[0], pos[1] - ee[1])
+            if distance < best_distance:
+                best, best_distance = name, distance
+        if best is None or best_distance > self.GRASP_CAPTURE_RADIUS * 2:
+            return None
+        return best
+
+    def report_position(self, name):
+        """
+        Where the cell believes the part is, as a sensor would report
+        it: the true position plus a measurement error. The error is
+        fixed per part until it is picked, so repeated reads agree
+        with each other, as a real sensor's would.
+        """
+        true = self.get_object_position(name)
+        if not true or not self.perception_noise:
+            return true
+        error = self._perception_error.get(name)
+        if error is None:
+            error = (self.noise_rng.gauss(0, self.perception_noise),
+                     self.noise_rng.gauss(0, self.perception_noise))
+            self._perception_error[name] = error
+        return (true[0] + error[0], true[1] + error[1], true[2])
+
+    def pick_object(self, name):
+        self._perception_error.pop(name, None)   # take a new measurement
+        self.last_grip_width = None
+        pos = self.report_position(name)
         if not pos:
             self.logger.error(f"Object '{name}' not found")
             return {
@@ -767,7 +1013,11 @@ class FrankaPandaRobot:
         self.logger.info(f"Picking '{name}' at {pos}")
         self._sync_obstacles(ignore_object=name)
 
-        self.open_gripper()
+        # Per-part hints: which way the fingers open, and how far
+        # (parts with close neighbours, or sitting in a fixture).
+        hints = self.pick_hints.get(name, {})
+        self._approach_finger_axis = hints.get("finger_axis")
+        self.open_gripper(hints.get("open_to"))
         for _ in range(50):
             p.stepSimulation()
             time.sleep(self.sim_config["timestep"])
@@ -826,100 +1076,7 @@ class FrankaPandaRobot:
             p.stepSimulation()
             time.sleep(self.sim_config["timestep"])
 
-        # Attach the part exactly where it sits in the gripper.
-        # The constraint frame on the part is the gripper link pose
-        # expressed in the part's own frame, so the part keeps its
-        # grasp-time position and orientation and is not pulled
-        # sideways or twisted when the constraint engages.
-        obj_id   = self.objects[name]["id"]
-        obj_pos2 = self.get_object_position(name)
-
-        # A grasp only counts if the part is between the fingers.
-        ee_pos2 = self.get_end_effector_position()
-        miss = math.hypot(obj_pos2[0] - ee_pos2[0],
-                          obj_pos2[1] - ee_pos2[1])
-        if abs(obj_pos2[2] - ee_pos2[2]) > self.GRASP_CAPTURE_HEIGHT:
-            miss = max(miss, abs(obj_pos2[2] - ee_pos2[2]))
-        if miss > self.GRASP_CAPTURE_RADIUS:
-            print(f"  [PICK] ❌ Part is {miss*100:.1f}cm from the gripper "
-                  f"centre — not gripped")
-            self.open_gripper()
-            self._direct_move(ee_pos2[0], ee_pos2[1], ee_pos2[2] + 0.25,
-                              speed_factor=0.3)
-            self._sync_obstacles()
-            return {
-                "status": "failed", "action": "pick", "target": name,
-                "detail": f"grasp failed - '{name}' is {miss*100:.1f}cm "
-                          f"from the gripper centre"
-            }
-
-        link     = p.getLinkState(self.robot, self.end_effector)
-        part_pos, part_orn = p.getBasePositionAndOrientation(obj_id)
-        inv_pos, inv_orn   = p.invertTransform(part_pos, part_orn)
-        child_pos, child_orn = p.multiplyTransforms(
-            inv_pos, inv_orn, link[0], link[1]
-        )
-
-        self.grasp_constraint = p.createConstraint(
-            parentBodyUniqueId     = self.robot,
-            parentLinkIndex        = self.end_effector,
-            childBodyUniqueId      = obj_id,
-            childLinkIndex         = -1,
-            jointType              = p.JOINT_FIXED,
-            jointAxis              = [0, 0, 0],
-            parentFramePosition    = [0, 0, 0],
-            childFramePosition     = child_pos,
-            parentFrameOrientation = [0, 0, 0, 1],
-            childFrameOrientation  = child_orn
-        )
-        # Parts that are force-fitted must not slip in the grip when
-        # they meet a rim: the insertion judges depth from the gripper.
-        grip_n = 50 if self.objects[name].get("vision", True) else 200
-        p.changeConstraint(self.grasp_constraint, maxForce=grip_n)
-        self.grasped_object         = name
-        self.rrt.carrying_clearance = 0.04
-
-        # Verify grasp by lifting slightly
-        pre_z   = obj_pos2[2]
-        grasped = self._check_grasp_success(name, pre_z)
-        if not grasped:
-            p.removeConstraint(self.grasp_constraint)
-            self.grasp_constraint   = None
-            self.grasped_object     = None
-            self.rrt.carrying_clearance = 0
-            self.open_gripper()
-            return {
-                "status": "failed", "action": "pick",
-                "target": name,
-                "detail": "grasp failed - object did not lift"
-            }
-
-        print(f"  [PICK] Lifting '{name}'...")
-        self._direct_move(pos[0], pos[1], pos[2]+0.15, speed_factor=0.08,
-                          orn=self._tool_orn)
-        self._direct_move(pos[0], pos[1], pos[2]+0.40, speed_factor=0.3)
-        self._sync_obstacles()
-
-        lifted = self.get_object_position(name)
-        if lifted and lifted[2] < pos[2] + 0.15:
-            print(f"  [PICK] ⚠️  Grasp failed — object did not lift")
-            if self.grasp_constraint:
-                p.removeConstraint(self.grasp_constraint)
-                self.grasp_constraint = None
-            self.grasped_object         = None
-            self.rrt.carrying_clearance = 0
-            return {
-                "status": "failed", "action": "pick", "target": name,
-                "detail": "grasp failed — object did not lift"
-            }
-
-        self.logger.success(f"Picked '{name}'!")
-        return {
-            "status": "success", "action": "pick", "target": name,
-            "position": list(pos),
-            "detail": (f"picked {name} from "
-                       f"({pos[0]:.2f},{pos[1]:.2f},{pos[2]:.2f})")
-        }
+        return self._complete_grasp(name)
 
     def insert_part(self, name, pocket, on_step=None):
         """Seat the held part in a pocket by force-guided insertion."""

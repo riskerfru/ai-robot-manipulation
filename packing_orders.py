@@ -22,10 +22,9 @@ from dataclasses import dataclass, field
 import config as cfg
 from cell import packing as P
 
-TRAY_OFFSETS_MM = [(2.0, -1.5), (-1.5, 2.0), (1.0, 2.0), (-2.0, -1.0)]
-
 NUMBER_WORDS = {"one": 1, "two": 2, "three": 3, "four": 4, "five": 5,
-                "six": 6, "a": 1, "an": 1}
+                "six": 6, "seven": 7, "eight": 8, "nine": 9, "ten": 10,
+                "eleven": 11, "twelve": 12, "a": 1, "an": 1}
 
 
 class PlanError(Exception):
@@ -50,34 +49,35 @@ class Plan:
 def line_facts(line):
     """The SKU master and line state, as given to the planner."""
     return {
+        "scene": P.SCENE.get("name", ""),
         "current_format": line.format,
         "formats": {
             name: {
                 "description": f["description"],
-                "cartons_per_tray": P.nests_per_tray(name),
-                "flavours_in_stock": line.stock_levels(name),
+                "units_per_tray": P.nests_per_tray(name),
+                "products_in_stock": line.stock_levels(name),
             } for name, f in P.FORMATS.items()},
     }
 
 
 SYSTEM_PROMPT = """You plan orders for a robotic packing cell that packs \
-cartons of tea into shelf-ready trays.
+products into trays.
 
-You are given the line facts as JSON: the carton formats, how many cartons \
-one tray holds for each format, and how many cartons of each flavour are in \
-stock. The operator types an order in plain language.
+You are given the line facts as JSON: the pack formats, how many units one \
+tray holds for each format, and how many units of each product are in stock \
+in each format. The operator types an order in plain language.
 
 Reply with one JSON object and nothing else:
 {"format": "<format name>",
- "items": [{"flavour": "<flavour>", "quantity": <integer>}],
+ "items": [{"product": "<product>", "quantity": <integer>}],
  "note": "<one short sentence for the operator>"}
 
 Rules:
-- Use only format and flavour names that appear in the line facts.
+- Use only format and product names that appear in the line facts.
 - If the operator does not name a format, keep current_format. Words such \
 as "changeover", "switch" or a format name mean a different format.
-- The quantities must add up to exactly cartons_per_tray for the format.
-- Never ask for more of a flavour than is in stock.
+- The quantities must add up to exactly units_per_tray for the format.
+- Never ask for more of a product than is in stock in that format.
 - List the items in the order the operator gave them.
 - If the order cannot be packed under these rules, reply with \
 {"error": "<the reason, in one sentence>"} instead.
@@ -136,7 +136,8 @@ def _items_from(data):
     for item in items:
         if not isinstance(item, dict):
             raise ValueError("each item must be an object")
-        out.append((item.get("flavour"), item.get("quantity")))
+        out.append((item.get("product", item.get("flavour")),
+                    item.get("quantity")))
     return out
 
 
@@ -190,11 +191,13 @@ def plan_offline(order, line):
     counts = "|".join(list(NUMBER_WORDS) + [r"\d+"])
     flavours = "|".join(P.FLAVOUR_COLOURS)
     items = []
-    for qty, flavour in re.findall(rf"\b({counts})\s+({flavours})\b", text):
+    for qty, flavour in re.findall(rf"\b({counts})\s+({flavours})s?\b",
+                                   text):
         items.append((flavour, int(qty) if qty.isdigit()
                       else NUMBER_WORDS[qty]))
     if not items:
-        raise PlanError("no quantities and flavours found in the order")
+        raise PlanError("no quantities and products found in the order "
+                        "(the built-in parser needs e.g. 'two lemon')")
     items, problems = validate(fmt, items, line)
     if problems:
         raise PlanError("; ".join(problems))
@@ -218,6 +221,22 @@ def make_planner(offline=False):
 
 # ---- running an order --------------------------------------------
 
+def quiet_scan(cell):
+    """Scan the cell and log what the camera found."""
+    import contextlib
+    import io
+    line = cell.robot.packing_line
+    with contextlib.redirect_stdout(io.StringIO()):
+        found = line.scan()
+    cell.audit.log("scan", format=line.format,
+                   found=[{"product": d.product,
+                           "x": round(d.x, 4), "y": round(d.y, 4),
+                           "pixels": d.pixels} for d in found],
+                   hidden=len(line.hidden),
+                   stock=line.stock_levels())
+    return found
+
+
 def run_order(cell, order, planner, tray_number=0):
     """
     Plan, change over if needed, pack, check. Returns a dict with the
@@ -227,6 +246,10 @@ def run_order(cell, order, planner, tray_number=0):
     line = cell.robot.packing_line
     audit = cell.audit
     audit.log("order_text", order=order)
+    # The planner is told what the camera can see, so an order for
+    # cartons that are not there is refused before anything moves.
+    quiet_scan(cell)
+    seen = line.stock_levels()
     try:
         plan = planner(order, line)
     except PlanError as exc:
@@ -257,15 +280,27 @@ def run_order(cell, order, planner, tray_number=0):
                       nests=P.nests_per_tray(plan.format),
                       pattern=f"{f['tray']['rows']} x {f['tray']['cols']}",
                       clearance_mm=P.CLEARANCE * 1000)
-        mm = TRAY_OFFSETS_MM[tray_number % len(TRAY_OFFSETS_MM)]
-        line.load_tray(plan.format, (mm[0] / 1000, mm[1] / 1000))
+        line.load_tray(plan.format)
         audit.log("tray_in", format=plan.format)
         for _ in range(60):
             cell.robot.step()
 
+    # Look again before packing: the cartons the camera can no longer
+    # see have gone, and the tray has moved.
+    quiet_scan(cell)
+    if any(qty > line.stock_levels().get(product, 0)
+           for product, qty in plan.items):
+        reason = ("the cartons the order needs are no longer all "
+                  "visible on the infeed")
+        audit.log("order_refused", order=order, reason=reason)
+        return {"refused": reason}
     subtasks = line.subtasks_for(plan.items)
+    before = len(audit.events("part_rejected"))
     result = cell.agent.run(order, subtasks=subtasks)
     check = line.check_tray()
+    rejected = [r["data"] for r in audit.events("part_rejected")[before:]]
     audit.log("tray_check", results=check,
-              seated=sum(c["seated"] for c in check), nests=len(check))
-    return {"plan": plan, "result": result, "check": check}
+              seated=sum(c["seated"] for c in check), nests=len(subtasks))
+    return {"plan": plan, "result": result, "check": check,
+            "planned": len(subtasks), "rejected": rejected,
+            "seen": seen}

@@ -112,6 +112,19 @@ class SupervisedRobot:
         return self._after_motion(
             "place", self._robot.place_object(x, y, *args, **kwargs))
 
+    def pick_at(self, x, y, centre_z, *args, **kwargs):
+        """Gated pick at a measured position (camera-driven)."""
+        label = kwargs.get("label", "part")
+        d = self._gate(MotionCommand("pick", (x, y, centre_z),
+                                     label=f"{label} at "
+                                           f"({x:.3f}, {y:.3f})",
+                                     payload_kg=self._part_mass,
+                                     source=self._source))
+        if not d.allowed:
+            return self._denied("pick", label, d)
+        return self._after_motion(
+            "pick", self._robot.pick_at(x, y, centre_z, *args, **kwargs))
+
     def insert_part(self, name, pocket, *args, **kwargs):
         tcp_z = self._safety.limits.workspace_z[0] + 0.10
         d = self._gate(MotionCommand("place", (pocket["x"], pocket["y"],
@@ -135,6 +148,6 @@ def _summarise(result):
     if isinstance(result, dict):
         keep = ("status", "action", "target", "detail", "position",
                 "verified_position", "seated_error_mm", "peak_force_n",
-                "searched", "search_offset_mm")
+                "searched", "search_offset_mm", "gripped", "tamped")
         return {k: result[k] for k in keep if k in result}
     return {"status": "success" if result else "failed"}

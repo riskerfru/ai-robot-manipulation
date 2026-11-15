@@ -42,7 +42,8 @@ def build_sim_cell(logger, gui=False, seed=None, randomize=False,
                    audit_path=None, with_plc=True, llm_enabled=False,
                    limits=None, bus=None, verifier_kwargs=None,
                    start_soft_plc=True, scene="dispatch",
-                   housing_offset=(0.0, 0.0)):
+                   housing_offset=(0.0, 0.0), line_noise=None,
+                   packing_scene=None):
     """
     Build a complete simulated cell. Returns a namespace with:
       robot (raw backend), supervised, safety, audit, agent,
@@ -71,11 +72,18 @@ def build_sim_cell(logger, gui=False, seed=None, randomize=False,
     elif scene == "packing":
         # Shelf-ready tray on the conveyor, cartons in two formats on
         # the infeed. The tray is a few millimetres off its mark.
+        from cell import packing as _packing
         from cell.packing import PackingLine
+        _packing.load_scene(packing_scene)      # raises SceneError
         positions = {}
         build_cell(robot, part_positions={}, gui=gui)
         robot.use_pocket_bias = True
-        robot.packing_line = PackingLine(robot, "standard", housing_offset)
+        first_offset = (housing_offset if tuple(housing_offset) != (0.0, 0.0)
+                        else None)          # None: seeded random offset
+        robot.packing_line = PackingLine(robot, None, first_offset,
+                                         noise=line_noise,
+                                         seed=seed if seed is not None
+                                         else 0)
         for _ in range(100):
             robot.step()
     else:
