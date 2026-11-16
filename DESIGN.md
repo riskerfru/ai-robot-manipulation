@@ -2,7 +2,7 @@
 
 ## Why PyBullet + Franka Panda
 
-Most agent-in-a-world submissions use a 2D grid or text environment because they are easy to define. I chose a 3D physics simulation with a real robot URDF for one reason: **the hard problems in robotics are physical, not textual**.
+Many language-model agent demonstrations use a 2D grid or a text environment because those are easy to define. I chose a 3D physics simulation with a real robot URDF for one reason: **the hard problems in robotics are physical, not textual**.
 
 A grid world lets an agent "pick up" an object by setting a flag. PyBullet forces you to deal with IK failures, grasp drift, object rolling, reachability limits, and visual servo oscillation — problems that actually exist on real hardware. The agent harness I built has to reason about all of these, not just plan a sequence of steps.
 
@@ -64,7 +64,7 @@ The key decision was **`place_slot` as a separate action from `place`**. When th
 
 ## What Did Not Work (and the fixes)
 
-**Visual servo oscillation** — the overhead camera detects object colour blobs, but for objects near the table edge (green at y=−0.30), the initial pixel offset was >50px. Applying correction naively caused the gripper to overshoot 16cm, dragging the object across the table via the grasp constraint. Fix: skip servoing if initial offset exceeds 25px; fall back to known PyBullet position. This is honest — in simulation, IK is exact and the known position needs no correction.
+**Visual servo oscillation** — the overhead camera detects object colour blobs, but for objects near the table edge (green at y=−0.30), the initial pixel offset was >50px. Applying correction naively caused the gripper to overshoot 16cm, dragging the object across the table via the grasp constraint. Fix: skip servoing if initial offset exceeds 25px; fall back to known PyBullet position. When servoing is skipped, the pick descends on the part's reported position with a closed-loop x/y hold, because position control alone left an error of several centimetres near the base.
 
 **Torque-sensing descent** — I attempted to detect table contact by monitoring joint torque spikes during descent. PyBullet's torque reporting is noisy and inconsistent with constrained objects; the threshold that worked for one pose failed for another. Fix: calibrated fixed descent heights (pick: z=0.20m, place: z=0.12m) derived from known object geometry. On real hardware this would be replaced by wrist force-torque sensing.
 

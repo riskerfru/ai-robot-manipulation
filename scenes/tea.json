@@ -1,0 +1,16 @@
+{
+  "name": "Tea cartons",
+  "item": "carton",
+  "products": {
+    "lemon": [0.96, 0.80, 0.16],
+    "mint":  [0.24, 0.70, 0.46],
+    "berry": [0.62, 0.26, 0.60]
+  },
+  "formats": {
+    "standard": {"size_mm": 50, "rows": 2, "cols": 2,
+                 "stock": {"lemon": 2, "mint": 2, "berry": 2}},
+    "travel":   {"size_mm": 40, "rows": 3, "cols": 2,
+                 "stock": {"lemon": 2, "mint": 2, "berry": 2}}
+  },
+  "damaged": [["standard", "mint", 1]]
+}

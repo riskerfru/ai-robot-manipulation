@@ -1,0 +1,12 @@
+{
+  "name": "Snack bar multipacks",
+  "item": "pack",
+  "products": ["oat", "nut", "cocoa"],
+  "formats": {
+    "family": {"size_mm": 55, "rows": 3, "cols": 1,
+               "stock": {"oat": 2, "nut": 2, "cocoa": 2}},
+    "mini":   {"size_mm": 40, "rows": 3, "cols": 2,
+               "stock": {"oat": 2, "nut": 2, "cocoa": 2}}
+  },
+  "damaged_random": 1
+}

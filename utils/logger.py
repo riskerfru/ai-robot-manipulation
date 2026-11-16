@@ -186,3 +186,9 @@ class RobotLogger:
         )
         self.info(summary)
         return summary
+
+class NullLogger:
+    """Logger that discards everything (headless evaluation, tests)."""
+
+    def __getattr__(self, name):
+        return lambda *args, **kwargs: None

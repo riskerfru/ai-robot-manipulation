@@ -1,0 +1,93 @@
+===============================================================
+  TALKING TO THE ROBOT
+===============================================================
+
+  python run_robot.py --gui
+
+A window opens with the cell laid out and nothing moving. Move
+things around with the mouse if you want to. When you are ready,
+type:
+
+    start
+
+The camera takes one look at the cell, then you can type anything
+you like.
+
+
+WHAT YOU CAN TYPE
+-----------------
+Whatever you want, in your own words. These all work:
+
+    put a green and a purple one in the tray
+    bin the yellow one
+    fill the tray, mostly berry
+    pack two lemon then send it out
+    change over to the travel size and fill it
+    what can you see?
+    is there any mint left?
+
+You do not have to use the product names. The model is told which
+colour each product is, so "the yellow one" finds the lemon.
+
+
+WHAT HAPPENS WHEN YOU PRESS ENTER
+---------------------------------
+1. The model is handed a briefing: what this cell is, what the
+   camera saw in its last look, what is already in the tray,
+   whether the gripper is holding anything, and the seven things
+   the robot can physically do.
+
+2. The model replies with a list of steps.
+
+3. Nothing moves yet. The code checks every step against the real
+   state of the cell:
+       - is the gripper empty before a pick?
+       - is that nest free, and does it exist on this tray?
+       - can the camera actually see one of those?
+       - is the gripper empty before sending a tray out?
+   If any step fails, the reasons go back to the model once and it
+   tries again. If it is still wrong, the command is refused and
+   you are told why. The robot does not attempt it.
+
+4. The checked steps run through the same safety gate and the same
+   audit trail as everything else in this cell.
+
+You will see the plan printed before the robot moves, so you can
+watch it decide and then watch it do it.
+
+
+THE SEVEN THINGS THE ROBOT CAN DO
+---------------------------------
+    scan           look at the cell again
+    pick           pick one item up
+    place          put it in a nest, the reject bin, or back
+    insert         pick an item and seat it in a nest
+    change_format  swap the tray for the other size
+    dispatch       send the tray out, full or not
+    report         say something back to you
+
+The model can put these in any order, as many as the job needs.
+It cannot invent an eighth. Ask it to stack them in a pyramid or
+open a box and it will tell you it cannot, rather than trying.
+
+
+HONEST LIMITS
+-------------
+    - It only knows what the camera saw at the last look. If you
+      move something in the window, type "have another look"
+      first.
+    - It can be wrong about what you meant. Read the plan it
+      prints. If it is not what you wanted, say so in the next
+      command.
+    - The checks stop impossible steps, not unwise ones. "Bin
+      everything" is a perfectly valid plan and it will do it.
+    - Each command costs one or two calls to the model, so it
+      costs a little money per command.
+
+
+IF YOU HAVE NO API KEY
+----------------------
+This mode needs the model; it is the whole point of it. For the
+fixed packing orders that run without a key, use:
+
+    python run_packing.py --offline --gui

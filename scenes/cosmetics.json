@@ -1,0 +1,16 @@
+{
+  "name": "Skincare gift sets",
+  "item": "box",
+  "products": {
+    "cream": [0.95, 0.86, 0.72],
+    "serum": [0.30, 0.55, 0.80],
+    "mask":  [0.80, 0.40, 0.55]
+  },
+  "formats": {
+    "retail": {"size_mm": 45, "rows": 2, "cols": 2,
+               "stock": {"cream": 3, "serum": 2, "mask": 2}},
+    "sample": {"size_mm": 35, "rows": 2, "cols": 2,
+               "stock": {"cream": 2, "serum": 2}}
+  },
+  "damaged_random": 1
+}

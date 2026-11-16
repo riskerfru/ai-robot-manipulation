@@ -5,6 +5,7 @@
 #   + Autonomous Agent Loop (--auto flag)
 # =============================================================
 
+import os
 import sys
 import time
 import argparse
@@ -24,6 +25,11 @@ from perception.clip_detector import CLIPDetector
 # Agent loop imports
 from agent_loop import WarehouseAgent, EMERGENCY_STOP
 from reachability_viz import ReachabilityVisualiser
+from cell.scene import build_cell, sample_part_positions
+from cell.factory import default_limits
+from audit.trail import AuditTrail
+from safety.supervisor import SafetySupervisor
+from safety.supervised_robot import SupervisedRobot
 
 
 def build_configs():
@@ -156,11 +162,19 @@ def handle_special_command(user_input, robot, ai, planner, joints, logger,
 
     # ---- Emergency stop ----
     if cmd in ["stop", "estop", "e-stop", "emergency stop", "halt"]:
-        EMERGENCY_STOP.trigger("user command")
+        if hasattr(robot, "safety"):
+            robot.safety.emergency_stop("operator console")
+        else:
+            EMERGENCY_STOP.trigger("user command")
         print("  🛑 Emergency stop triggered. Type 'resume' to clear.")
         return True
 
     if cmd in ["resume", "clear stop"]:
+        if hasattr(robot, "safety"):
+            decision = robot.safety.reset(operator="operator_console")
+            if not decision.allowed:
+                print(f"  ❌ Reset refused: {decision.reason}")
+                return True
         EMERGENCY_STOP.reset()
         return True
 
@@ -448,8 +462,9 @@ def run_interactive(robot, ai, planner, joints, logger, vision, agent,
 
 
 def run_auto_demo(robot, ai_config, logger, order):
-    """Run a single autonomous order and exit — for demo/submission"""
-    agent = WarehouseAgent(robot, ai_config, logger)
+    """Run a single autonomous order and exit"""
+    agent = WarehouseAgent(robot, ai_config, logger,
+                           audit=getattr(robot, "_audit", None))
     result = agent.run(order)
 
     print("\n" + "="*50)
@@ -498,130 +513,42 @@ def main():
     logger.log_robot_mode(cfg.MODE, cfg.ROBOT_TYPE)
 
     print("Initializing systems...")
-    robot   = FrankaPandaRobot(robot_config, logger)
+    raw_robot = FrankaPandaRobot(robot_config, logger)
+
+    # Every motion command - typed, planned or from the language
+    # model - goes through the safety supervisor and the audit trail.
+    os.makedirs("audit_logs", exist_ok=True)
+    audit  = AuditTrail(time.strftime("audit_logs/session_%Y%m%d_%H%M%S.jsonl"))
+    safety = SafetySupervisor(default_limits())
+
+    def _on_trip(state, code, reason):
+        audit.log("safety_trip", state=state.value, code=code.value,
+                  reason=reason)
+        EMERGENCY_STOP.trigger(f"{state.value}: {reason}")
+
+    safety.on_trip(_on_trip)
+    robot = SupervisedRobot(raw_robot, safety, audit, source="operator")
     ai      = AIController(ai_config, logger)
     planner = TaskPlanner(planner_config, logger)
     joints  = JointController(robot, logger)
     tools   = RobotTools(robot, logger)
     ai.set_tools(tools)
     vision  = ClaudeVision(ai_config, logger)
-    agent   = WarehouseAgent(robot, ai_config, logger)
+    agent   = WarehouseAgent(robot, ai_config, logger, audit=audit)
 
     clip = CLIPDetector(logger)
     clip.load()
 
-    # Add table — visual surface only (not an RRT obstacle)
-    # Table top at z=0.1m, centred at (0.35, 0.0)
-    # Size: 0.7m wide (x), 0.8m deep (y), 0.1m thick
-    print("\nAdding table...")
-    TABLE_Z = 0.1          # table top surface height
-    TABLE_CX = 0.42        # table centre x
-    TABLE_CY = 0.0         # table centre y
-    TABLE_W  = 0.42        # half-width: 0.0 to 0.84m in x  (bigger)
-    TABLE_D  = 0.50        # half-depth: -0.50 to 0.50m in y (bigger)
-    TABLE_H  = 0.05        # half-thickness
-
-    table_col = p.createCollisionShape(
-        p.GEOM_BOX,
-        halfExtents=[TABLE_W, TABLE_D, TABLE_H]
-    )
-    table_vis = p.createVisualShape(
-        p.GEOM_BOX,
-        halfExtents=[TABLE_W, TABLE_D, TABLE_H],
-        rgbaColor=[0.55, 0.35, 0.15, 1.0]   # warm wood brown
-    )
-    table_id = p.createMultiBody(
-        baseMass=0,                          # static
-        baseCollisionShapeIndex=table_col,
-        baseVisualShapeIndex=table_vis,
-        basePosition=[TABLE_CX, TABLE_CY, TABLE_H]  # z = half-thickness
-    )
-    print(f"  Table surface at z={TABLE_Z:.2f}m  "
-          f"x:[{TABLE_CX-TABLE_W:.2f} to {TABLE_CX+TABLE_W:.2f}]  "
-          f"y:[{TABLE_CY-TABLE_D:.2f} to {TABLE_CY+TABLE_D:.2f}]")
-    print(f"  Reachable zone: 0.25m - 0.75m from robot base")
-
-    # Add objects ON the table surface
-    # z = TABLE_Z + half-object-height (objects are 0.04m cubes -> z=0.14)
-    OBJ_Z = TABLE_Z + 0.025   # sits on table top
-    print("\nAdding objects on table...")
-    import random
+    # Build the cell (table, parts, conveyor slots) from cell/layout.py,
+    # the same definition the headless evaluation and PLC runner use.
+    print("\nBuilding cell...")
+    part_positions = None
     if args.random:
-        robot.add_object("red",
-            x=round(random.uniform(0.20, 0.55), 2),
-            y=round(random.uniform(-0.30, 0.30), 2),
-            color=[1, 0, 0, 1], z=OBJ_Z)
-        robot.add_object("blue",
-            x=round(random.uniform(0.20, 0.55), 2),
-            y=round(random.uniform(-0.30, 0.30), 2),
-            color=[0, 0, 1, 1], z=OBJ_Z)
-        robot.add_object("green",
-            x=round(random.uniform(0.20, 0.55), 2),
-            y=round(random.uniform(-0.30, 0.30), 2),
-            color=[0, 1, 0, 1], z=OBJ_Z)
-        print("  Objects placed at random positions on table")
-    else:
-        # Objects in safe green zone (0.30-0.65m from base)
-        robot.add_object("red",   x=0.40, y=0.00,  color=[1, 0, 0, 1], z=OBJ_Z)
-        robot.add_object("blue",  x=0.40, y=0.30,  color=[0, 0, 1, 1], z=OBJ_Z)
-        robot.add_object("green", x=0.40, y=-0.30, color=[0, 1, 0, 1], z=OBJ_Z)
-
-    # No walls — clean table scene for warehouse demo
-
-    # ── CONVEYOR SLOTS ──
-    # Three numbered slots at far edge of table.
-    # No colours — avoids confusion with block colours.
-    # Slot 1 = leftmost (y=+0.30), Slot 2 = centre (y=0.00), Slot 3 = rightmost (y=-0.30)
-    SLOT_X  = 0.63    # x position of all slots — within safe reach zone
-    SLOT_Z  = 0.10    # same height as table surface
-    SLOT_W  = 0.07    # half-width of slot marker
-    SLOT_H  = 0.004   # very thin marker
-
-    SLOTS = {
-        1: (SLOT_X,  0.30),
-        2: (SLOT_X,  0.00),
-        3: (SLOT_X, -0.30),
-    }
-
-    # Conveyor base platform — dark grey
-    conv_col = p.createCollisionShape(
-        p.GEOM_BOX, halfExtents=[0.08, 0.44, 0.005])
-    conv_vis = p.createVisualShape(
-        p.GEOM_BOX, halfExtents=[0.08, 0.44, 0.005],
-        rgbaColor=[0.15, 0.15, 0.15, 1.0])
-    p.createMultiBody(baseMass=0,
-                      baseCollisionShapeIndex=conv_col,
-                      baseVisualShapeIndex=conv_vis,
-                      basePosition=[SLOT_X, 0.0, SLOT_Z + 0.005])
-
-    # Slot markers — all white/light grey (no colour coding)
-    SLOT_COLOUR = [0.85, 0.85, 0.85, 1.0]   # light grey
-    for slot_num, (sx, sy) in SLOTS.items():
-        sc = p.createCollisionShape(
-            p.GEOM_BOX, halfExtents=[SLOT_W, SLOT_W, SLOT_H])
-        sv = p.createVisualShape(
-            p.GEOM_BOX, halfExtents=[SLOT_W, SLOT_W, SLOT_H],
-            rgbaColor=SLOT_COLOUR)
-        p.createMultiBody(baseMass=0,
-                          baseCollisionShapeIndex=sc,
-                          baseVisualShapeIndex=sv,
-                          basePosition=[sx, sy, SLOT_Z + 0.012])
-
-        # Slot number label (debug line from slot to above)
-        p.addUserDebugText(
-            text=str(slot_num),
-            textPosition=[sx, sy, SLOT_Z + 0.08],
-            textColorRGB=[1, 1, 1],
-            textSize=1.5
-        )
-        p.addUserDebugLine(
-            [sx - SLOT_W, sy - SLOT_W, SLOT_Z + 0.013],
-            [sx + SLOT_W, sy - SLOT_W, SLOT_Z + 0.013],
-            [0.9, 0.9, 0.9], 2
-        )
-
-    # Store slot positions so agent_loop can access them
-    robot.conveyor_slots = SLOTS
+        import random
+        part_positions = sample_part_positions(random.Random())
+        print("  Parts placed at random positions on the table")
+    SLOTS = build_cell(robot, part_positions=part_positions,
+                       gui=cfg.SIM_GUI, settle_steps=0)
 
     print(f"  Conveyor slots (numbered, no colour coding):")
     for n, (sx, sy) in SLOTS.items():
