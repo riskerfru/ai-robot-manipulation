@@ -39,6 +39,7 @@ class FrankaPandaRobot:
         self._finger_yaw   = None
         self._insertion    = None
         self.on_force      = None     # optional callback(z, force_n)
+        self.last_grasp_z  = None     # gripper height at the last grasp
         self.use_force_sensing = True # False: comparison runs only
         self.pocket_bias   = (0.0, 0.0)   # learned fixture offset (x, y)
         self.pocket_bias_samples = []
@@ -407,6 +408,13 @@ class FrankaPandaRobot:
         else:
             waypoints = [np.array(current), np.array(target)]
 
+        # The route, for whoever is reading the log.
+        shown = waypoints if len(waypoints) <= 6 else (
+            list(waypoints[:3]) + list(waypoints[-2:]))
+        print(f"  [PATH] {len(waypoints)} waypoints: " + " -> ".join(
+            f"({w[0]:.2f}, {w[1]:.2f}, {w[2]:.2f})" for w in shown)
+            + (" (middle ones not shown)" if len(waypoints) > 6 else ""))
+
         if self.motion_config["smooth_trajectory"] and len(waypoints) > 1:
             try:
                 trajectory = self.trajectory.generate_smooth_trajectory(
@@ -439,7 +447,18 @@ class FrankaPandaRobot:
         """
         current = p.getLinkState(self.robot, self.end_effector)[1]
         yaw     = p.getEulerFromQuaternion(current)[2]
-        if finger_axis in ("x", "y"):
+        if isinstance(finger_axis, tuple):
+            # (direction, period): fingers open along this direction
+            # (radians from x), for a part the camera found turned at
+            # an angle. A square part can be taken at any quarter
+            # turn, so the nearest one to the present yaw is used.
+            angle, period = finger_axis
+            base = self._finger_yaw_for_y() + (angle - math.pi / 2)
+            yaw  = base + round((yaw - base) / period) * period
+        elif isinstance(finger_axis, (int, float)):
+            base = self._finger_yaw_for_y() + (finger_axis - math.pi / 2)
+            yaw  = base + round((yaw - base) / math.pi) * math.pi
+        elif finger_axis in ("x", "y"):
             base = self._finger_yaw_for_y()
             if finger_axis == "x":
                 base += math.pi / 2
@@ -447,6 +466,73 @@ class FrankaPandaRobot:
         else:
             yaw  = round(yaw / (math.pi / 2)) * (math.pi / 2)
         return p.getQuaternionFromEuler([math.pi, 0.0, yaw])
+
+    def _square_up(self, x, y, z, finger_axis, speed=0.7):
+        """
+        Bring the tool vertical above (x, y, z) with the fingers
+        opening the way asked, and check that it really got there.
+        The same finger line can be reached with the wrist turned
+        half a turn either way, and the arm can hold only some of
+        those from a given pose, so each is tried and measured.
+        Returns (orientation, (dx, dy) position trim), or (None, ...)
+        when no wrist angle holds.
+        """
+        first = self._down_orientation(finger_axis)
+        yaw0 = p.getEulerFromQuaternion(first)[2]
+        if isinstance(finger_axis, tuple):
+            want, period = finger_axis
+        elif finger_axis == "x":
+            want, period = 0.0, math.pi
+        elif finger_axis == "y":
+            want, period = math.pi / 2, math.pi
+        elif isinstance(finger_axis, (int, float)):
+            want, period = float(finger_axis), math.pi
+        else:
+            want, period = None, math.pi / 2
+        turns = (0, 1, -1) if period > 3.0 else (0, 1, -1, 2, -2)
+
+        def finger_error():
+            if want is None or len(self.finger_joints) < 2:
+                return 0.0
+            a = p.getLinkState(self.robot, self.finger_joints[0])[0]
+            b = p.getLinkState(self.robot, self.finger_joints[1])[0]
+            e = (math.atan2(b[1] - a[1], b[0] - a[0]) - want) % math.pi
+            return min(e, math.pi - e)
+
+        for turn in turns:
+            orn = p.getQuaternionFromEuler(
+                [math.pi, 0.0, yaw0 + turn * period])
+            ox = oy = 0.0
+            last, stuck, err, fe = None, 0, 1.0, 1.0
+            for _ in range(12):
+                self._direct_move(x + ox, y + oy, z, speed_factor=speed,
+                                  orn=orn)
+                ee = self.get_end_effector_position()
+                err = math.hypot(x - ee[0], y - ee[1])
+                fe = finger_error()
+                if err < 0.0015 and fe < 0.05:
+                    break
+                # A wrist joint on its stop stops making progress:
+                # give this angle up and try the other way round.
+                key = (round(err, 3), round(fe, 2))
+                stuck = stuck + 1 if key == last else 0
+                last = key
+                if stuck >= 2:
+                    break
+                if err < 0.02:
+                    ox = float(np.clip(ox + (x - ee[0]), -0.06, 0.06))
+                    oy = float(np.clip(oy + (y - ee[1]), -0.06, 0.06))
+            if err > 0.004 or fe > 0.09:
+                continue
+            m = p.getMatrixFromQuaternion(
+                p.getLinkState(self.robot, self.end_effector)[1])
+            if -m[8] < 0.9986:                  # more than 3 deg off plumb
+                continue
+            if turn:
+                print("  [WRIST] Turned the other way round to reach "
+                      "this angle")
+            return orn, (ox, oy)
+        return None, (0.0, 0.0)
 
     def _finger_yaw_for_y(self):
         """
@@ -634,6 +720,15 @@ class FrankaPandaRobot:
             ee = self.get_end_effector_position()
             off_x = float(np.clip(off_x + gain * (x - ee[0]), -0.06, 0.06))
             off_y = float(np.clip(off_y + gain * (y - ee[1]), -0.06, 0.06))
+
+        if isinstance(self._approach_finger_axis, tuple):
+            # A part the camera found turned at an angle.
+            squared, trim = self._square_up(x, y, approach_z,
+                                            self._approach_finger_axis)
+            if squared is not None:
+                orn = squared
+                self._tool_orn = orn
+                off_x, off_y = trim
 
         for _ in range(3):
             hold_xy(1.0)
@@ -923,6 +1018,9 @@ class FrankaPandaRobot:
         for _ in range(60):
             p.stepSimulation()
             time.sleep(self.sim_config["timestep"])
+        # How high the gripper was when it closed: with the height of
+        # what the part stood on, this says where the part's foot is.
+        self.last_grasp_z = self.get_end_effector_position()[2]
 
         name = self._body_in_gripper()
         if name is None:
@@ -1103,6 +1201,87 @@ class FrankaPandaRobot:
             1000 * math.hypot(bias[0], bias[1]), 1)
         self._sync_obstacles()
         return result
+
+    def place_by_touch(self, x, y, touch_z, finger_axis=None, open_to=None,
+                       on_step=None, label="surface", strict=False,
+                       step_m=0.0005):
+        """
+        Put the held part down by feel. touch_z is the gripper height
+        at which the camera expects the part to meet the surface; the
+        arm stops short of it and creeps down until the force sensor
+        reports contact, then lets go. The surface is felt, not assumed.
+        """
+        if not self.grasped_object:
+            return {"status": "failed", "action": "place", "target": label,
+                    "detail": "not holding anything"}
+        from motion.insertion import ForceGuidedInsertion
+        TOUCH_N = 1.0      # lighter than an insertion: nothing to seat
+        if self._insertion is None:
+            self._insertion = ForceGuidedInsertion(self)
+        ins, name = self._insertion, self.grasped_object
+        on_step = on_step or self.on_force
+
+        ee = self.get_end_effector_position()
+        safe_z = max(0.42, touch_z + 0.22)
+        hold = self._tool_orn or p.getLinkState(
+            self.robot, self.end_effector)[1]
+        print(f"  [PLACE] Lifting clear to z={safe_z:.3f}")
+        self._direct_move(ee[0], ee[1], safe_z, speed_factor=0.4, orn=hold)
+        print(f"  [PLACE] Travelling to ({x:.3f}, {y:.3f})")
+        for _ in range(8):
+            self._direct_move(x, y, safe_z, speed_factor=0.3)
+            ee = self.get_end_effector_position()
+            if math.hypot(x - ee[0], y - ee[1]) < 0.004:
+                break
+        orn, _ = self._square_up(x, y, safe_z, finger_axis)
+        if orn is None and not strict:
+            other = {"x": "y", "y": "x"}.get(finger_axis)
+            print("  [PLACE] Wrist cannot hold that angle here, trying "
+                  "a quarter turn")
+            orn, _ = self._square_up(x, y, safe_z, other)
+        if orn is None:
+            return {"status": "failed", "action": "place", "target": label,
+                    "detail": f"the arm cannot hold the tool square above "
+                              f"({x:.3f}, {y:.3f})"}
+        self._tool_orn = orn
+        for _ in range(4):
+            ee = ins._move(x, y, safe_z, orn, speed=0.15)
+            if math.hypot(x - ee[0], y - ee[1]) < 0.001:
+                break
+
+        z = touch_z + 0.025
+        print(f"  [PLACE] Down to z={z:.3f}, then feeling for the surface")
+        for _ in range(2):
+            ins._move(x, y, z, orn, speed=0.1)
+        force, floor = 0.0, touch_z - 0.012
+        while z > floor:
+            # Half-millimetre steps where contact is expected: the
+            # arm is stiff, and whatever it lands on may be loose.
+            z -= 0.002 if z > touch_z + 0.008 else step_m
+            ins._move(x, y, z, orn)
+            # Read the sensor through the whole settling time and keep
+            # the peak: first contact can show for only an instant.
+            force = 0.0
+            for _ in range(12):
+                p.stepSimulation()
+                time.sleep(self.sim_config["timestep"])
+                force = max(force, ins.contact_force(name))
+            if on_step:
+                on_step(z, force)
+            if force > TOUCH_N:
+                break
+        felt = force > TOUCH_N
+        ins._release(name, open_to)
+        self._retreat_straight_up(orn)
+        self._sync_obstacles()
+        return {"status": "success", "action": "place", "target": label,
+                "placed": name, "felt_contact": felt,
+                "contact_z": round(z, 4), "expected_z": round(touch_z, 4),
+                "force_n": round(force, 1),
+                "detail": (f"touched down at {force:.1f} N, "
+                           f"{1000 * (z - touch_z):+.1f} mm from where the "
+                           f"camera expected" if felt else
+                           "no contact felt; released at the lower limit")}
 
     def _retreat_straight_up(self, orn, clear_z=0.45):
         """

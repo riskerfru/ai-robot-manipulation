@@ -125,6 +125,20 @@ class SupervisedRobot:
         return self._after_motion(
             "pick", self._robot.pick_at(x, y, centre_z, *args, **kwargs))
 
+    def place_by_touch(self, x, y, touch_z, *args, **kwargs):
+        """Gated place that feels for the surface."""
+        held = getattr(self._robot, "grasped_object", None)
+        d = self._gate(MotionCommand("place", (x, y, touch_z),
+                                     label=f"{kwargs.get('label', held)} at "
+                                           f"({x:.3f}, {y:.3f})",
+                                     payload_kg=self._part_mass,
+                                     source=self._source))
+        if not d.allowed:
+            return self._denied("place", held, d)
+        return self._after_motion(
+            "place", self._robot.place_by_touch(x, y, touch_z,
+                                                *args, **kwargs))
+
     def insert_part(self, name, pocket, *args, **kwargs):
         tcp_z = self._safety.limits.workspace_z[0] + 0.10
         d = self._gate(MotionCommand("place", (pocket["x"], pocket["y"],

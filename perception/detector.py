@@ -255,3 +255,199 @@ class OverheadDetector:
         if metres_per_pixel <= 0:
             return None
         return (size_m / metres_per_pixel) ** 2
+
+
+# =============================================================
+#   OBJECT FINDER - finds whatever is on the table
+#
+#   Nothing is known in advance: no colours, no shapes, no sizes,
+#   no names. The camera gives a colour image and a depth image.
+#   Anything standing higher than the table is a thing; touching
+#   regions of one colour are one thing. Each is measured: where
+#   it is, how big, how tall, how round, which way it is turned.
+#   What it IS is left to whoever reads the measurements.
+# =============================================================
+
+class Blob:
+    """One measured thing. Plain numbers, no identity."""
+
+    def __init__(self, **fields):
+        self.__dict__.update(fields)
+
+    def __repr__(self):
+        return (f"<blob at ({self.x:.3f}, {self.y:.3f}) "
+                f"{1000 * self.long:.0f}x{1000 * self.short:.0f} mm, "
+                f"{1000 * self.height:.0f} tall, "
+                f"round {self.roundness:.2f}>")
+
+
+class ObjectFinder(OverheadDetector):
+    RISE_M = 0.005            # higher than the table by this = a thing
+    MAX_RISE_M = 0.25         # higher than this = the robot, ignored
+    COLOUR_EDGE = 0.10        # colour step that separates two things
+    MIN_PIXELS = 150
+    FLAT_M = 0.004            # a top face is flat to this
+    CONTAINER_M = 0.13        # wider than this = something to put in
+
+    def capture_rgbd(self):
+        """Colour image plus the world position of every pixel."""
+        cam = self.camera.cameras[self.camera_name]
+        height, width = self._shape()
+        # Even, shadow-free light, as under the diffuse dome lamp a
+        # vision cell uses: a hard shadow reads as a colour edge.
+        _, _, rgb, depth, _ = p.getCameraImage(
+            width=width, height=height,
+            viewMatrix=cam["view"], projectionMatrix=cam["projection"],
+            shadow=0, renderer=p.ER_TINY_RENDERER)
+        image = (np.reshape(rgb, (height, width, 4))
+                 [:, :, :3].astype(np.float64) / 255.0)
+        depth = np.reshape(depth, (height, width)).astype(np.float64)
+        inv = self._matrices()
+        u, v = np.meshgrid(np.arange(width), np.arange(height))
+        ndc = np.stack([2.0 * (u + 0.5) / width - 1.0,
+                        1.0 - 2.0 * (v + 0.5) / height,
+                        2.0 * depth - 1.0,
+                        np.ones_like(depth)], axis=-1)
+        world = ndc @ inv.T
+        world = world[..., :3] / world[..., 3:4]
+        self.last_image = image
+        self.last_world = world
+        return image, world
+
+    @staticmethod
+    def _min_rect(points):
+        """Smallest rectangle round a set of x, y points."""
+        if len(points) > 2500:
+            points = points[:: len(points) // 2500 + 1]
+        best = None
+        for degree in range(0, 90):
+            a = np.radians(degree)
+            c, s = np.cos(a), np.sin(a)
+            along = points[:, 0] * c + points[:, 1] * s
+            across = -points[:, 0] * s + points[:, 1] * c
+            la, lb = np.ptp(along), np.ptp(across)
+            if best is None or la * lb < best[0]:
+                best = (la * lb, a, la, lb)
+        _, angle, la, lb = best
+        if lb > la:
+            la, lb, angle = lb, la, angle + np.pi / 2
+        return la, lb, angle          # long, short, direction of long
+
+    def find(self, area=((0.24, 0.80), (-0.50, 0.50))):
+        """
+        Measure everything standing on the table inside the area.
+        Returns (blobs, table_z). Largest first.
+        """
+        image, world = self.capture_rgbd()
+        X, Y, Z = world[..., 0], world[..., 1], world[..., 2]
+        inside = ((X >= area[0][0]) & (X <= area[0][1])
+                  & (Y >= area[1][0]) & (Y <= area[1][1]))
+        if not inside.any():
+            return [], None
+        rows, cols = np.where(inside)
+        r0, r1, c0, c1 = rows.min(), rows.max() + 1, cols.min(), cols.max() + 1
+        image, X, Y, Z = (a[r0:r1, c0:c1] for a in (image, X, Y, Z))
+        inside = inside[r0:r1, c0:c1]
+
+        # The table is the height most of the picture is at.
+        levels = np.round(Z[inside] * 1000).astype(int)
+        values, counts = np.unique(levels, return_counts=True)
+        table_z = values[np.argmax(counts)] / 1000.0
+        near = np.abs(Z - table_z) < 0.002
+        table_z = float(np.median(Z[near & inside]))
+        pixel_m = float(np.median(np.abs(np.diff(X, axis=1))[near[:, 1:]]))
+
+        raised = (inside & (Z > table_z + self.RISE_M)
+                  & (Z < table_z + self.MAX_RISE_M))
+        # A pixel belongs with its neighbours only where the colour
+        # does not step: that splits a thing from what it stands in.
+        smooth = raised.copy()
+        step_r = np.abs(np.diff(image, axis=0)).max(axis=2) > self.COLOUR_EDGE
+        step_c = np.abs(np.diff(image, axis=1)).max(axis=2) > self.COLOUR_EDGE
+        smooth[:-1, :][step_r] = False
+        smooth[1:, :][step_r] = False
+        smooth[:, :-1][step_c] = False
+        smooth[:, 1:][step_c] = False
+        labels = self._label(smooth)
+        self.last_labels = labels
+
+        blobs = []
+        for label in np.unique(labels):
+            if label == 0:
+                continue
+            mask = labels == label
+            if mask.sum() < self.MIN_PIXELS:
+                continue
+            z = Z[mask]
+            top = float(np.percentile(z, 97))
+            pts = np.stack([X[mask], Y[mask]], axis=1)
+            span = max(np.ptp(pts[:, 0]), np.ptp(pts[:, 1]))
+            colour = image[mask].mean(axis=0)
+            if span >= self.CONTAINER_M:
+                # Walls and a floor. The floor is found by height, not
+                # colour: it is the level most of the inside is at,
+                # below the rim. (Its shade can differ from the rim's,
+                # so it is not always part of this same region.)
+                rr, cc = np.where(mask)
+                box = (slice(rr.min(), rr.max() + 1),
+                       slice(cc.min(), cc.max() + 1))
+                zb = Z[box]
+                low = (zb < top - 0.006) & (zb > table_z + 0.0025)
+                if low.sum() < 0.2 * zb.size:
+                    continue                    # a slab, not a container
+                lv = np.round(zb[low] * 1000).astype(int)
+                vals, cnts = np.unique(lv, return_counts=True)
+                floor = vals[np.argmax(cnts)] / 1000.0
+                on_floor = np.abs(zb - floor) < 0.003
+                floor = float(np.median(zb[on_floor]))
+                fx, fy = X[box][on_floor], Y[box][on_floor]
+                long_, short_, angle = self._min_rect(pts)
+                blobs.append(Blob(
+                    container=True, x=float((pts[:, 0].min()
+                                             + pts[:, 0].max()) / 2),
+                    y=float((pts[:, 1].min() + pts[:, 1].max()) / 2),
+                    rgb=colour, long=float(long_), short=float(short_),
+                    angle=float(angle), top=top, ground=table_z,
+                    floor=float(floor), height=top - table_z,
+                    inner_x=(float(fx.min()), float(fx.max())),
+                    inner_y=(float(fy.min()), float(fy.max())),
+                    roundness=0.0, fill=0.0, pixels=int(mask.sum())))
+                continue
+            # Keep the top face only. From off to one side the camera
+            # also sees a sliver of the thing's flank, which would pull
+            # the centre over; the flank is lower, so height removes it.
+            whole = mask.sum()
+            mask = mask & (Z > top - self.FLAT_M)
+            if mask.sum() < max(self.MIN_PIXELS, 0.4 * whole):
+                continue                        # a side face, not a top
+            z = Z[mask]
+            pts = np.stack([X[mask], Y[mask]], axis=1)
+            colour = image[mask].mean(axis=0)
+            raw_long, raw_short, angle = self._min_rect(pts)
+            # The colour-step rule trims one pixel off every edge, and
+            # pixel centres span one pixel less than the pixels do.
+            long_, short_ = raw_long + 3 * pixel_m, raw_short + 3 * pixel_m
+            seen_area = mask.sum() * pixel_m ** 2
+            centre = pts.mean(axis=0)
+            reach = (np.linalg.norm(pts - centre, axis=1).max()
+                     + 0.5 * pixel_m)
+            # What it stands on: the level just outside its edge.
+            rr, cc = np.where(mask)
+            a0, a1 = max(rr.min() - 14, 0), rr.max() + 15
+            b0, b1 = max(cc.min() - 14, 0), cc.max() + 15
+            ring = ~mask[a0:a1, b0:b1]
+            around = Z[a0:a1, b0:b1][ring]
+            around = around[around < top - 0.008]
+            ground = (float(np.percentile(around, 20)) if around.size
+                      else table_z)
+            blobs.append(Blob(
+                container=False, x=float(centre[0]), y=float(centre[1]),
+                rgb=colour, long=float(long_), short=float(short_),
+                angle=float(angle), top=float(np.median(z)), ground=ground,
+                height=float(np.median(z)) - ground,
+                roundness=float(seen_area / (np.pi * reach ** 2)),
+                fill=float(seen_area / ((raw_long + pixel_m)
+                                        * (raw_short + pixel_m))),
+                pixels=int(mask.sum())))
+        blobs.sort(key=lambda b: -b.pixels)
+        return blobs, table_z

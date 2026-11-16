@@ -43,7 +43,7 @@ def build_sim_cell(logger, gui=False, seed=None, randomize=False,
                    limits=None, bus=None, verifier_kwargs=None,
                    start_soft_plc=True, scene="dispatch",
                    housing_offset=(0.0, 0.0), line_noise=None,
-                   packing_scene=None):
+                   packing_scene=None, open_count=6):
     """
     Build a complete simulated cell. Returns a namespace with:
       robot (raw backend), supervised, safety, audit, agent,
@@ -86,6 +86,16 @@ def build_sim_cell(logger, gui=False, seed=None, randomize=False,
                                          else 0)
         for _ in range(100):
             robot.step()
+    elif scene == "open":
+        # A table of things nobody has described to the robot: random
+        # shapes, colours and places. Found by the camera alone.
+        from cell import openscene as _open
+        positions = {}
+        built = _open.build_open_scene(robot, seed=seed or 0,
+                                       count=open_count, gui=gui)
+        robot.open_cell = _open.OpenCell(robot, built, gui=gui)
+        robot.stations = {}
+        robot.pockets = {}
     else:
         positions = sample_part_positions(rng) if randomize else None
         build_cell(robot, part_positions=positions, gui=gui)
