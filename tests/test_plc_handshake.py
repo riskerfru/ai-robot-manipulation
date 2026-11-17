@@ -164,3 +164,71 @@ def test_fieldbus_read_failure_denies_motion():
     interlocks = PLCInterlocks(DeadBus())
     safety = SafetySupervisor(interlock_source=interlocks)
     assert not safety.authorize(MotionCommand("home")).allowed
+
+
+class BeatRecorder(InMemoryBus):
+    """Records the time of every ROBOT_HEARTBEAT write."""
+
+    def __init__(self):
+        super().__init__()
+        import time as _time
+        self._now = _time.monotonic
+        self.beats = []
+
+    def write(self, name, value):
+        if name == "ROBOT_HEARTBEAT":
+            self.beats.append(self._now())
+        super().write(name, value)
+
+
+def test_robot_heartbeat_keeps_beating_through_a_long_job():
+    # The PLC's watchdog is 1 s. A job that blocks for 1.5 s must not
+    # leave ROBOT_HEARTBEAT frozen, or the PLC drops MOTION_PERMIT
+    # mid-motion and the cell faults.
+    import time
+    bus = BeatRecorder()
+    plc = SoftPLC(bus)
+    clock = FakeClock()
+    interlocks = PLCInterlocks(bus, clock=clock)
+    interlocks.read(); plc.scan(); interlocks.read()
+    safety = SafetySupervisor(interlock_source=interlocks, clock=clock)
+    window = {}
+
+    def slow_job():
+        window["start"] = time.monotonic()
+        time.sleep(1.5)
+        window["end"] = time.monotonic()
+
+    agent = FakeAgent(safety, during=slow_job)
+    ctrl = CellController(bus, agent, safety, interlocks=interlocks,
+                          heartbeat_period_s=0.05)
+    plc.request_job(job_id=9, recipe=1)
+    assert ctrl.poll() is CellState.DONE
+
+    during = [t for t in bus.beats if window["start"] <= t <= window["end"]]
+    assert len(during) >= 10
+    edges = [window["start"]] + during + [window["end"]]
+    assert max(b - a for a, b in zip(edges, edges[1:])) < 0.5
+
+    # The job-scoped beat stops with the job.
+    n = len(bus.beats)
+    time.sleep(0.3)
+    assert len(bus.beats) == n
+
+
+def test_runner_heartbeat_is_idempotent_and_stops():
+    import time
+    bus = BeatRecorder()
+    plc = SoftPLC(bus)
+    interlocks = PLCInterlocks(bus, clock=FakeClock())
+    safety = SafetySupervisor(interlock_source=interlocks)
+    ctrl = CellController(bus, FakeAgent(safety), safety,
+                          heartbeat_period_s=0.02)
+    assert ctrl.start_heartbeat() is True
+    assert ctrl.start_heartbeat() is False      # already running
+    time.sleep(0.2)
+    ctrl.stop_heartbeat()
+    n = len(bus.beats)
+    assert n >= 5
+    time.sleep(0.1)
+    assert len(bus.beats) == n

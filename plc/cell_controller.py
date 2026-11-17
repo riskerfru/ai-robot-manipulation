@@ -14,8 +14,17 @@
 #   After FAULT the controller stays faulted until the PLC drops
 #   JOB_START and pulses FAULT_RESET, and the safety supervisor
 #   accepts the reset (i.e. the cause has actually cleared).
+#
+#   ROBOT_HEARTBEAT keeps counting while a job runs. The agent's
+#   run() blocks for the whole job, so a background thread beats
+#   for its duration; otherwise the PLC's watchdog (1 s in the
+#   ladder program) would see the robot as dead and drop
+#   MOTION_PERMIT mid-motion. A runner that leaves the controller
+#   unpolled between jobs can keep the beat going with
+#   start_heartbeat().
 # =============================================================
 
+import threading
 from enum import Enum
 
 from audit.trail import NullAudit
@@ -33,7 +42,8 @@ class CellState(str, Enum):
 
 class CellController:
 
-    def __init__(self, bus, agent, safety, audit=None, interlocks=None):
+    def __init__(self, bus, agent, safety, audit=None, interlocks=None,
+                 heartbeat_period_s=0.1):
         self.bus = bus
         self.agent = agent
         self.safety = safety
@@ -42,9 +52,47 @@ class CellController:
         self.state = CellState.READY
         self.fault_code = FaultCode.NONE
         self.last_result = None
+        self.heartbeat_period_s = heartbeat_period_s
         self._beat = 0
+        self._beat_lock = threading.Lock()
+        self._beater = None                # (thread, stop event) or None
         self._prev_reset = False
         self._publish()
+
+    # ---- heartbeat -----------------------------------------------
+    def _beat_once(self):
+        with self._beat_lock:
+            self._beat = (self._beat + 1) & 0xFFFF
+            self.bus.write("ROBOT_HEARTBEAT", self._beat)
+
+    def _beat_loop(self, stop):
+        while not stop.wait(self.heartbeat_period_s):
+            try:
+                self._beat_once()
+            except Exception:
+                # Fieldbus hiccup: skip this beat. If the link stays
+                # down the PLC's watchdog drops the permit, which is
+                # the right outcome.
+                pass
+
+    def start_heartbeat(self):
+        """Beat in the background until stop_heartbeat(). Idempotent."""
+        if self._beater is not None:
+            return False
+        stop = threading.Event()
+        thread = threading.Thread(target=self._beat_loop, args=(stop,),
+                                  name="robot-heartbeat", daemon=True)
+        self._beater = (thread, stop)
+        thread.start()
+        return True
+
+    def stop_heartbeat(self):
+        if self._beater is None:
+            return
+        thread, stop = self._beater
+        self._beater = None
+        stop.set()
+        thread.join(timeout=2 * self.heartbeat_period_s + 1.0)
 
     # ---- one scan ------------------------------------------------
     def poll(self):
@@ -77,6 +125,15 @@ class CellController:
 
     # ---- job -----------------------------------------------------
     def _run_job(self):
+        # Beat for the length of the job unless a runner already is.
+        started_here = self.start_heartbeat()
+        try:
+            self._run_job_body()
+        finally:
+            if started_here:
+                self.stop_heartbeat()
+
+    def _run_job_body(self):
         job_id = int(self.bus.read("JOB_ID"))
         recipe_no = int(self.bus.read("RECIPE"))
         self.audit.job_id = job_id
@@ -146,7 +203,6 @@ class CellController:
         self.state = state
 
     def _publish(self):
-        self._beat = (self._beat + 1) & 0xFFFF
         healthy = self.safety.state is SafetyState.RUN
         w = self.bus.write
         w("READY", self.state is CellState.READY and healthy)
@@ -156,7 +212,7 @@ class CellController:
         w("FAULT_CODE", self.fault_code)
         w("DEGRADED", bool(getattr(self.agent, "degraded", False)))
         w("ROBOT_READY", healthy)
-        w("ROBOT_HEARTBEAT", self._beat)
+        self._beat_once()
         robot = getattr(self.agent, "robot", None)
         occupants = getattr(robot, "slot_occupants", {}) or {}
         mask = 0
