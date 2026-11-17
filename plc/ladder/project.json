@@ -1,0 +1,253 @@
+{
+  "meta": {
+    "name": "cell_plc",
+    "type": "plc-project"
+  },
+  "data": {
+    "dataTypes": [],
+    "globalVariableLists": [],
+    "pous": [],
+    "configuration": {
+      "resource": {
+        "tasks": [
+          {
+            "name": "task0",
+            "triggering": "Cyclic",
+            "interval": "T#20ms",
+            "priority": 1
+          }
+        ],
+        "instances": [
+          {
+            "name": "instance0",
+            "task": "task0",
+            "program": "main"
+          }
+        ],
+        "globalVariables": [
+          {
+            "name": "ESTOP_OK",
+            "type": {
+              "definition": "base-type",
+              "value": "BOOL"
+            },
+            "location": "%QX0.0",
+            "documentation": "",
+            "debug": false
+          },
+          {
+            "name": "GUARD_CLOSED",
+            "type": {
+              "definition": "base-type",
+              "value": "BOOL"
+            },
+            "location": "%QX0.1",
+            "documentation": "",
+            "debug": false
+          },
+          {
+            "name": "MODE_AUTO",
+            "type": {
+              "definition": "base-type",
+              "value": "BOOL"
+            },
+            "location": "%QX0.2",
+            "documentation": "",
+            "debug": false
+          },
+          {
+            "name": "MOTION_PERMIT",
+            "type": {
+              "definition": "base-type",
+              "value": "BOOL"
+            },
+            "location": "%QX0.3",
+            "documentation": "",
+            "debug": false
+          },
+          {
+            "name": "JOB_START",
+            "type": {
+              "definition": "base-type",
+              "value": "BOOL"
+            },
+            "location": "%QX0.4",
+            "documentation": "",
+            "debug": false
+          },
+          {
+            "name": "FAULT_RESET",
+            "type": {
+              "definition": "base-type",
+              "value": "BOOL"
+            },
+            "location": "%QX0.5",
+            "documentation": "",
+            "debug": false
+          },
+          {
+            "name": "JOB_ID",
+            "type": {
+              "definition": "base-type",
+              "value": "WORD"
+            },
+            "location": "%QW0",
+            "documentation": "",
+            "debug": false
+          },
+          {
+            "name": "RECIPE",
+            "type": {
+              "definition": "base-type",
+              "value": "WORD"
+            },
+            "location": "%QW1",
+            "documentation": "",
+            "debug": false
+          },
+          {
+            "name": "PLC_HEARTBEAT",
+            "type": {
+              "definition": "base-type",
+              "value": "WORD"
+            },
+            "location": "%QW2",
+            "documentation": "",
+            "debug": false
+          },
+          {
+            "name": "READY",
+            "type": {
+              "definition": "base-type",
+              "value": "BOOL"
+            },
+            "location": "%QX2.0",
+            "documentation": "",
+            "debug": false
+          },
+          {
+            "name": "BUSY",
+            "type": {
+              "definition": "base-type",
+              "value": "BOOL"
+            },
+            "location": "%QX2.1",
+            "documentation": "",
+            "debug": false
+          },
+          {
+            "name": "DONE",
+            "type": {
+              "definition": "base-type",
+              "value": "BOOL"
+            },
+            "location": "%QX2.2",
+            "documentation": "",
+            "debug": false
+          },
+          {
+            "name": "FAULT",
+            "type": {
+              "definition": "base-type",
+              "value": "BOOL"
+            },
+            "location": "%QX2.3",
+            "documentation": "",
+            "debug": false
+          },
+          {
+            "name": "DEGRADED",
+            "type": {
+              "definition": "base-type",
+              "value": "BOOL"
+            },
+            "location": "%QX2.4",
+            "documentation": "",
+            "debug": false
+          },
+          {
+            "name": "ROBOT_READY",
+            "type": {
+              "definition": "base-type",
+              "value": "BOOL"
+            },
+            "location": "%QX2.5",
+            "documentation": "",
+            "debug": false
+          },
+          {
+            "name": "FAULT_CODE",
+            "type": {
+              "definition": "base-type",
+              "value": "WORD"
+            },
+            "location": "%QW16",
+            "documentation": "",
+            "debug": false
+          },
+          {
+            "name": "PARTS_OK",
+            "type": {
+              "definition": "base-type",
+              "value": "WORD"
+            },
+            "location": "%QW17",
+            "documentation": "",
+            "debug": false
+          },
+          {
+            "name": "PARTS_FAILED",
+            "type": {
+              "definition": "base-type",
+              "value": "WORD"
+            },
+            "location": "%QW18",
+            "documentation": "",
+            "debug": false
+          },
+          {
+            "name": "SLOT_MASK",
+            "type": {
+              "definition": "base-type",
+              "value": "WORD"
+            },
+            "location": "%QW19",
+            "documentation": "",
+            "debug": false
+          },
+          {
+            "name": "ROBOT_HEARTBEAT",
+            "type": {
+              "definition": "base-type",
+              "value": "WORD"
+            },
+            "location": "%QW20",
+            "documentation": "",
+            "debug": false
+          },
+          {
+            "name": "JOB_ID_ECHO",
+            "type": {
+              "definition": "base-type",
+              "value": "WORD"
+            },
+            "location": "%QW21",
+            "documentation": "",
+            "debug": false
+          },
+          {
+            "name": "CELL_FAULTED",
+            "type": {
+              "definition": "base-type",
+              "value": "BOOL"
+            },
+            "location": "",
+            "documentation": "",
+            "debug": false
+          }
+        ]
+      }
+    },
+    "libraries": []
+  }
+}

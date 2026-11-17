@@ -8,3 +8,4 @@ audit_logs/
 eval_out/
 slot_calibration.json
 demo_out/
+plc/ladder/build/
