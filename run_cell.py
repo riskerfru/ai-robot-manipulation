@@ -14,8 +14,16 @@
 #   python run_cell.py --plc 127.0.0.1    against the real ladder
 #                                         program (OpenPLC, Modbus TCP)
 #
-#   No API key is needed: jobs are PLC-selected recipes. Free-text
-#   orders through the language model use main.py.
+#   Typed instructions (Day 2): the language model picks a recipe
+#   number, the runner writes it to RECIPE, the PLC decides.
+#   python run_cell.py --plc 127.0.0.1 --order "send the red part out"
+#   python run_cell.py --plc 127.0.0.1 --interactive
+#       instructions, plus bench commands: !guard open, !guard close,
+#       !estop, !estop release, !reset, !status, !quit
+#
+#   No API key is needed for --jobs: jobs are PLC-selected recipes.
+#   --order / --interactive use the language model when a key is
+#   configured, and a keyword match on recipe names when not.
 # =============================================================
 
 import argparse
@@ -23,6 +31,7 @@ import contextlib
 import io
 import os
 import sys
+import threading
 import time
 
 import config as cfg
@@ -30,7 +39,9 @@ from audit.trail import verify_file
 from cell.factory import build_sim_cell
 from cell.scene import refill_infeed
 from plc.cell_controller import CellState
-from plc.plc_link import LivePlcLink, SoftPlcLink, refusal_reason
+from plc.plc_link import LivePlcLink, PlcMonitor, SoftPlcLink, refusal_reason
+from plc.recipe_planner import NO_RECIPE, choose_recipe
+from plc.recipes import RECIPES
 from plc.signals import FaultCode
 
 FAULT_NAMES = {v: k for k, v in vars(FaultCode).items() if k.isupper()}
@@ -38,8 +49,13 @@ STATUS = ["READY", "BUSY", "DONE", "FAULT", "FAULT_CODE", "PARTS_OK",
           "PARTS_FAILED", "SLOT_MASK", "DEGRADED"]
 
 
+_SAY_LOCK = threading.Lock()
+
+
 def say(text=""):
-    print(text, file=sys.__stdout__, flush=True)
+    # The PLC monitor prints from its own thread.
+    with _SAY_LOCK:
+        print(text, file=sys.__stdout__, flush=True)
 
 
 def show(cell, label):
@@ -115,6 +131,95 @@ def recover(cell, link):
     poll(cell)
 
 
+def model_client(enabled):
+    """Anthropic client for the recipe planner, or None (keyword fallback)."""
+    if not enabled or not cfg.ANTHROPIC_API_KEY:
+        return None
+    import anthropic
+    return anthropic.Anthropic(api_key=cfg.ANTHROPIC_API_KEY,
+                               timeout=cfg.AI.get("timeout_s", 20.0),
+                               max_retries=1)
+
+
+def plan(instruction, client):
+    """Instruction -> recipe number, logged. Returns the number (0 = none)."""
+    try:
+        result = choose_recipe(instruction, client, cfg.AI["model"])
+    except Exception as e:
+        say(f"  [MODEL] unavailable ({type(e).__name__}: {e}); "
+            f"falling back to keyword match")
+        result = choose_recipe(instruction, None)
+    name = RECIPES.get(result.recipe, {}).get("name", "not an approved recipe")
+    who = "model" if result.source == "model" else "keywords"
+    say(f'  [MODEL] "{instruction}" -> recipe {result.recipe} ({name}) '
+        f'[{who}: {result.reason}]')
+    return result.recipe
+
+
+def instruct(cell, link, instruction, client, scene, job_id):
+    """
+    Typed instruction -> model -> recipe number -> RECIPE -> PLC.
+    Returns the controller state after the job, or None if nothing ran.
+    """
+    recipe = plan(instruction, client)
+    if recipe == NO_RECIPE:
+        say("  [CELL] no approved recipe fits; nothing sent to the PLC")
+        return None
+    if recipe == 3 and scene != "assembly":
+        say("  [CELL] note: recipe 3 needs the assembly scene "
+            "(--scene assembly); the robot will fault here")
+    say(f"  [CELL] RECIPE := {recipe} written to the PLC")
+    state = run_job(cell, link, job_id, recipe)
+    if state is None:
+        say(f"  [CELL] PLC refused recipe {recipe}: "
+            f"{refusal_reason(cell.bus, recipe)}")
+        say("  [CELL] the model's choice was not run; nothing it says "
+            "changes that")
+        return None
+    show(cell, f"job {cell.bus.read('JOB_ID_ECHO')} finished")
+    if state is CellState.DONE:
+        link.acknowledge_done()
+        wait_ready(cell)
+        show(cell, "PLC acknowledged")
+    else:
+        say("  [CELL] cell faulted; clear the cause, then !reset")
+    return state
+
+
+BENCH = {
+    "!guard open":    ("guard door opened",       "open_guard"),
+    "!guard close":   ("guard door closed",       "close_guard"),
+    "!estop":         ("emergency stop pressed",  "press_estop"),
+    "!estop release": ("emergency stop released", "release_estop"),
+}
+
+
+def bench(cell, link, command):
+    """Simulated plant / operator actions. Returns False on !quit."""
+    if command in ("!quit", "!q", "!exit"):
+        return False
+    if command in BENCH:
+        text, method = BENCH[command]
+        say(f"  [PLANT] {text}")
+        getattr(link, method)()
+        time.sleep(0.1)
+        poll(cell)
+    elif command == "!reset":
+        say("  [OPERATOR] FAULT_RESET")
+        link.reset_fault()
+        poll(cell)
+        link.release_reset()
+        poll(cell)
+        show(cell, "after reset")
+    elif command == "!status":
+        poll(cell)
+        show(cell, "status")
+    else:
+        say("  bench commands: " + ", ".join(list(BENCH) +
+                                              ["!reset", "!status", "!quit"]))
+    return True
+
+
 def install_hazard(cell, link, scenario):
     """After the first part is placed, trigger the scenario's hazard."""
     if scenario == "none":
@@ -158,6 +263,14 @@ def main():
                     help="run against a real PLC over Modbus TCP (the "
                          "OpenPLC ladder program) instead of the soft PLC")
     ap.add_argument("--plc-port", type=int, default=502)
+    ap.add_argument("--order", action="append", default=None,
+                    metavar="TEXT",
+                    help="typed instruction: the model picks a recipe, the "
+                         "PLC decides (repeatable)")
+    ap.add_argument("--interactive", action="store_true",
+                    help="type instructions and bench commands at a prompt")
+    ap.add_argument("--no-model", action="store_true",
+                    help="keyword match instead of the language model")
     args = ap.parse_args()
     if args.plc and args.scenario == "plc":
         ap.error("--scenario plc stalls the soft PLC's heartbeat; a real "
@@ -198,10 +311,42 @@ def main():
     say(f"  CELL RUN   scenario={args.scenario}   plc={plc_name}   "
         f"audit={args.audit}")
     say("=" * 100)
+    monitor = PlcMonitor(cell.bus, say)
+    monitor.start()
     poll(cell)
     show(cell, "cell started")
 
     job_id = 1000
+    if args.order or args.interactive:
+        client = model_client(not args.no_model)
+        say(f"  planner: {'model ' + cfg.AI['model'] if client else 'keyword match'}")
+        for text in args.order or []:
+            job_id += 1
+            say(f"\n  > {text}")
+            state = instruct(cell, link, text, client, args.scene, job_id)
+            if state is CellState.FAULT:
+                break
+            if state is CellState.DONE and args.scene != "assembly":
+                with contextlib.redirect_stdout(io.StringIO()):
+                    refill_infeed(cell.robot)
+        while args.interactive:
+            try:
+                text = input("\n  > ").strip()
+            except EOFError:
+                break
+            if not text:
+                continue
+            if text.startswith("!"):
+                if not bench(cell, link, text.lower()):
+                    break
+                continue
+            job_id += 1
+            state = instruct(cell, link, text, client, args.scene, job_id)
+            if state is CellState.DONE and args.scene != "assembly":
+                with contextlib.redirect_stdout(io.StringIO()):
+                    refill_infeed(cell.robot)
+        jobs = 0                         # instructions replace scripted jobs
+
     for n in range(jobs):
         job_id += 1
         say(f"\n  PLC: job request recipe={recipe}")
@@ -224,6 +369,7 @@ def main():
                 refill_infeed(cell.robot)
         poll(cell)
 
+    monitor.stop()
     if args.plc:
         cell.controller.stop_heartbeat()
     link.stop()
