@@ -11,6 +11,8 @@
 #   python run_cell.py --scenario estop   emergency stop mid-job
 #   python run_cell.py --scenario plc     PLC heartbeat lost mid-job
 #   python run_cell.py --gui              same, in the 3D viewer
+#   python run_cell.py --plc 127.0.0.1    against the real ladder
+#                                         program (OpenPLC, Modbus TCP)
 #
 #   No API key is needed: jobs are PLC-selected recipes. Free-text
 #   orders through the language model use main.py.
@@ -28,6 +30,7 @@ from audit.trail import verify_file
 from cell.factory import build_sim_cell
 from cell.scene import refill_infeed
 from plc.cell_controller import CellState
+from plc.plc_link import LivePlcLink, SoftPlcLink, refusal_reason
 from plc.signals import FaultCode
 
 FAULT_NAMES = {v: k for k, v in vars(FaultCode).items() if k.isupper()}
@@ -58,12 +61,61 @@ def poll(cell):
         return cell.controller.poll()
 
 
-def run_job(cell, job_id, recipe):
-    cell.soft_plc.request_job(job_id, recipe)
-    return poll(cell)
+START_WAIT_S = 2.0       # how long the PLC gets to raise JOB_START
 
 
-def install_hazard(cell, scenario):
+def run_job(cell, link, job_id, recipe):
+    """
+    Request a job and poll until the robot has run it. Returns the
+    controller state (DONE / FAULT), or None if the PLC never raised
+    JOB_START. A refused request is withdrawn, so it cannot start
+    later on its own.
+    """
+    link.request_job(job_id, recipe)
+    deadline = time.monotonic() + START_WAIT_S
+    while True:
+        state = poll(cell)               # runs the job once JOB_START is high
+        if state is not CellState.READY:
+            return state
+        if time.monotonic() > deadline:
+            link.withdraw()
+            return None
+        time.sleep(0.01)
+
+
+def wait_ready(cell, timeout_s=2.0):
+    """Poll until the controller is back to READY (PLC dropped JOB_START)."""
+    deadline = time.monotonic() + timeout_s
+    state = poll(cell)
+    while state is not CellState.READY and time.monotonic() < deadline:
+        time.sleep(0.01)
+        state = poll(cell)
+    return state
+
+
+def recover(cell, link):
+    """The operator's fault recovery, as the PLC would see it."""
+    say("  PLC: FAULT_RESET while the cause is still present")
+    link.reset_fault()
+    poll(cell)
+    show(cell, "reset attempt 1")
+    link.release_reset()
+    poll(cell)
+
+    say("  Operator clears the cause, then FAULT_RESET")
+    link.close_guard()
+    link.release_estop()
+    link.resume_heartbeat()
+    time.sleep(0.1)
+    poll(cell)
+    link.reset_fault()
+    poll(cell)
+    show(cell, "reset attempt 2")
+    link.release_reset()
+    poll(cell)
+
+
+def install_hazard(cell, link, scenario):
     """After the first part is placed, trigger the scenario's hazard."""
     if scenario == "none":
         return
@@ -76,11 +128,13 @@ def install_hazard(cell, scenario):
         if not fired["done"]:
             fired["done"] = True
             if scenario == "guard":
-                cell.soft_plc.open_guard()
+                say("  [PLANT] guard door opened")
+                link.open_guard()
             elif scenario == "estop":
-                cell.soft_plc.press_estop()
+                say("  [PLANT] emergency stop pressed")
+                link.press_estop()
             elif scenario == "plc":
-                cell.soft_plc.stall_heartbeat()
+                link.stall_heartbeat()
                 time.sleep(cell.interlocks.heartbeat_timeout_s + 0.2)
         return out
 
@@ -100,7 +154,14 @@ def main():
     ap.add_argument("--verbose", action="store_true",
                     help="show the robot's own motion log")
     ap.add_argument("--audit", default="audit_logs/cell.jsonl")
+    ap.add_argument("--plc", metavar="HOST", default=None,
+                    help="run against a real PLC over Modbus TCP (the "
+                         "OpenPLC ladder program) instead of the soft PLC")
+    ap.add_argument("--plc-port", type=int, default=502)
     args = ap.parse_args()
+    if args.plc and args.scenario == "plc":
+        ap.error("--scenario plc stalls the soft PLC's heartbeat; a real "
+                 "PLC's heartbeat cannot be stalled from here")
     global QUIET
     QUIET = quiet = not args.verbose
 
@@ -111,18 +172,31 @@ def main():
         os.remove(args.audit)
     with contextlib.redirect_stdout(io.StringIO() if quiet
                                     else sys.__stdout__):
+        plc = dict(plc_host=args.plc, plc_port=args.plc_port)
         if args.scene == "assembly":
             cell = build_sim_cell(logger, gui=args.gui, audit_path=args.audit,
                                   scene="assembly",
-                                  housing_offset=(0.002, -0.0015))
+                                  housing_offset=(0.002, -0.0015), **plc)
         else:
-            cell = build_sim_cell(logger, gui=args.gui, audit_path=args.audit)
+            cell = build_sim_cell(logger, gui=args.gui, audit_path=args.audit,
+                                  **plc)
+    if args.plc:
+        link = LivePlcLink(cell.bus)
+        # Between polls the controller is idle; keep the robot heartbeat
+        # going so the ladder's watchdog does not drop MOTION_PERMIT.
+        cell.controller.start_heartbeat()
+    else:
+        link = SoftPlcLink(cell.soft_plc, cell.bus)
+    link.start()
     recipe = 3 if args.scene == "assembly" else 1
     jobs = 1 if args.scene == "assembly" else args.jobs
-    install_hazard(cell, args.scenario)
+    install_hazard(cell, link, args.scenario)
 
+    plc_name = (f"OpenPLC at {args.plc}:{args.plc_port}" if args.plc
+                else "soft PLC")
     say("=" * 100)
-    say(f"  CELL RUN   scenario={args.scenario}   audit={args.audit}")
+    say(f"  CELL RUN   scenario={args.scenario}   plc={plc_name}   "
+        f"audit={args.audit}")
     say("=" * 100)
     poll(cell)
     show(cell, "cell started")
@@ -130,31 +204,19 @@ def main():
     job_id = 1000
     for n in range(jobs):
         job_id += 1
-        say(f"\n  PLC: JOB_START job={job_id} recipe={recipe}")
-        state = run_job(cell, job_id, recipe)
-        show(cell, f"job {job_id} finished")
+        say(f"\n  PLC: job request recipe={recipe}")
+        state = run_job(cell, link, job_id, recipe)
+        if state is None:
+            say(f"  PLC: JOB_START withheld for recipe {recipe}: "
+                f"{refusal_reason(cell.bus, recipe)}")
+            continue
+        show(cell, f"job {cell.bus.read('JOB_ID_ECHO')} finished")
 
         if state is CellState.FAULT:
-            say("  PLC: FAULT_RESET while the cause is still present")
-            cell.soft_plc.reset_fault()
-            poll(cell)
-            show(cell, "reset attempt 1")
-            cell.soft_plc.release_reset()
-            poll(cell)
-
-            say("  Operator clears the cause, then FAULT_RESET")
-            cell.soft_plc.close_guard()
-            cell.soft_plc.release_estop()
-            cell.soft_plc.resume_heartbeat()
-            time.sleep(0.1)
-            poll(cell)
-            cell.soft_plc.reset_fault()
-            poll(cell)
-            show(cell, "reset attempt 2")
-            cell.soft_plc.release_reset()
+            recover(cell, link)
         else:
-            cell.soft_plc.acknowledge_done()
-            poll(cell)
+            link.acknowledge_done()
+            wait_ready(cell)
             show(cell, "PLC acknowledged")
 
         with contextlib.redirect_stdout(io.StringIO()):
@@ -162,7 +224,9 @@ def main():
                 refill_infeed(cell.robot)
         poll(cell)
 
-    cell.soft_plc.stop()
+    if args.plc:
+        cell.controller.stop_heartbeat()
+    link.stop()
     ok, count, _ = verify_file(args.audit)
     say(f"\n  Audit trail: {count} records, "
         f"{'chain intact' if ok else 'CHAIN BROKEN'}")

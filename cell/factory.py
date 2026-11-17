@@ -43,11 +43,16 @@ def build_sim_cell(logger, gui=False, seed=None, randomize=False,
                    limits=None, bus=None, verifier_kwargs=None,
                    start_soft_plc=True, scene="dispatch",
                    housing_offset=(0.0, 0.0), line_noise=None,
-                   packing_scene=None, open_count=6):
+                   packing_scene=None, open_count=6,
+                   plc_host=None, plc_port=502):
     """
     Build a complete simulated cell. Returns a namespace with:
       robot (raw backend), supervised, safety, audit, agent,
       verifier, bus, soft_plc, interlocks, controller
+
+    plc_host: talk Modbus TCP to a real PLC (the OpenPLC ladder
+    program in plc/ladder) instead of InMemoryBus + SoftPLC. soft_plc
+    is then None; the PLC must already be running.
     """
     from agent_loop import EMERGENCY_STOP, WarehouseAgent
     from hardware.sim_backend import make_sim_robot
@@ -103,7 +108,15 @@ def build_sim_cell(logger, gui=False, seed=None, randomize=False,
     audit = AuditTrail(audit_path)
 
     soft_plc = interlocks = None
-    if with_plc:
+    if with_plc and plc_host:
+        from plc.bus import ModbusBus
+        bus = ModbusBus(plc_host, port=plc_port)    # raises if unreachable
+        interlocks = PLCInterlocks(bus)
+        if not interlocks.wait_until_alive():
+            raise RuntimeError(f"PLC at {plc_host}:{plc_port} is reachable "
+                               f"but its heartbeat is not moving - is the "
+                               f"program running?")
+    elif with_plc:
         bus = bus or InMemoryBus()
         soft_plc = SoftPLC(bus)
         if start_soft_plc:
