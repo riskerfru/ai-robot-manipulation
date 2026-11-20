@@ -61,7 +61,7 @@ class FollowRecorder(Recorder):
         if self.base is not None:
             x, y, _ = self.base.true_pose
             self.view = p.computeViewMatrixFromYawPitchRoll(
-                [x + 0.30, y, 0.30], 2.35, 62, -30, 0, 2)
+                [x + 0.35, y, 0.25], 2.5, -60, -34, 0, 2)
         super().frame()
 
 
