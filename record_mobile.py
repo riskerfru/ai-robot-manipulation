@@ -59,7 +59,7 @@ F_BANNER_S = RO.font("bold", 19)
 F_INSET = RO.font("bold", 13)
 F_STATION = RO.font("bold", 22)
 F_FIT = RO.font("bold", 14)
-RENDER_SCALE = 0.75             # render smaller, scale up: much faster
+RENDER_SCALE = 0.55             # render smaller, scale up: much faster
 
 
 class FollowRecorder(Recorder):
@@ -83,7 +83,7 @@ class FollowRecorder(Recorder):
         sw, sh = int(SCENE_W * RENDER_SCALE), int(H * RENDER_SCALE)
         view = self._view()
         raw = p.getCameraImage(sw, sh, view, self.proj,
-                               renderer=p.ER_TINY_RENDERER, shadow=1,
+                               renderer=p.ER_TINY_RENDERER, shadow=0,
                                lightDirection=[0.6, -0.5, 1.6])
         import numpy as np
         scene = Image.fromarray(np.reshape(raw[2], (sh, sw, 4))[:, :, :3]
