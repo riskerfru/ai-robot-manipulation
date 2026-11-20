@@ -57,6 +57,8 @@ class Panel(RO.Panel):
 F_BANNER = RO.font("bold", 30)
 F_BANNER_S = RO.font("bold", 19)
 F_INSET = RO.font("bold", 13)
+F_STATION = RO.font("bold", 22)
+F_FIT = RO.font("bold", 14)
 RENDER_SCALE = 0.75             # render smaller, scale up: much faster
 
 
@@ -79,19 +81,73 @@ class FollowRecorder(Recorder):
 
     def frame(self):
         sw, sh = int(SCENE_W * RENDER_SCALE), int(H * RENDER_SCALE)
-        raw = p.getCameraImage(sw, sh, self._view(), self.proj,
+        view = self._view()
+        raw = p.getCameraImage(sw, sh, view, self.proj,
                                renderer=p.ER_TINY_RENDERER, shadow=1,
                                lightDirection=[0.6, -0.5, 1.6])
         import numpy as np
         scene = Image.fromarray(np.reshape(raw[2], (sh, sw, 4))[:, :, :3]
                                 .astype("uint8")).resize((SCENE_W, H))
-        self._decorate(scene)
+        self._decorate(scene, view)
         self.hud.speed = self.steps_per_frame / 240 * 24
         self.last = self.hud.draw(scene)
         self._write(self.last)
 
-    def _decorate(self, scene):
+    def _project(self, view, x, y, z):
+        import numpy as np
+        V = np.array(view).reshape(4, 4).T
+        P = np.array(self.proj).reshape(4, 4).T
+        v = P @ V @ np.array([x, y, z, 1.0])
+        if v[3] <= 0:
+            return None
+        v = v[:3] / v[3]
+        if not (-1 < v[0] < 1 and -1 < v[1] < 1):
+            return None
+        return (v[0] + 1) / 2 * SCENE_W, (1 - v[1]) / 2 * H
+
+    def _labels(self, d, view):
+        from mobile import floor as F
+        from mobile.base import compose
+        names = {"STORAGE": "STORAGE - raw parts", "MACHINE": "MACHINE",
+                 "INSPECT": "INSPECTION", "DISPATCH": "DISPATCH"}
+        fittings = {"fixture": "machine fixture", "pad": "measuring pad",
+                    "bin": "reject bin", "tray": "outgoing tray"}
+        for st, sy in F.STATIONS.items():
+            pos = self._project(view, 0.62, sy, 0.62)
+            if pos:
+                text = names[st]
+                w = d.textlength(text, font=F_STATION)
+                x, y = pos[0] - w / 2, pos[1]
+                d.rectangle([x - 10, y - 6, x + w + 10, y + 30],
+                            fill=(10, 13, 17), outline=(250, 250, 250))
+                d.text((x, y - 2), text, font=F_STATION, fill=(255, 255, 255))
+            for role, (ox, oy), _, _ in F.EQUIPMENT.get(st, []):
+                wx, wy = compose((F.DOCK_X, sy, 0.0), ox, oy)
+                pos = self._project(view, wx, wy, F.TABLE_Z + 0.06)
+                if pos:
+                    text = fittings[role]
+                    w = d.textlength(text, font=F_FIT)
+                    x, y = pos[0] - w / 2, pos[1] - 30
+                    d.rectangle([x - 6, y - 3, x + w + 6, y + 19],
+                                fill=(250, 250, 250))
+                    d.text((x, y - 1), text, font=F_FIT, fill=(20, 22, 26))
+        pos = self._project(view, F.LANE_X, 0.0, 0.02)
+        if pos:
+            d.text((pos[0] - 70, pos[1] + 14), "pedestrian walkway",
+                   font=F_FIT, fill=(255, 225, 90))
+
+    def _decorate(self, scene, view=None):
         d = ImageDraw.Draw(scene)
+        if view is not None:
+            self._labels(d, view)
+        st = self.base.station if self.base is not None else None
+        names = {"STORAGE": "STORAGE", "MACHINE": "MACHINE",
+                 "INSPECT": "INSPECTION", "DISPATCH": "DISPATCH"}
+        text = (f"ROBOT IS AT: {names[st]}" if st else
+                "ROBOT IS DRIVING")
+        w = d.textlength(text, font=F_STATION)
+        d.rectangle([14, 100, 34 + w, 136], fill=(10, 13, 17))
+        d.text((24, 104), text, font=F_STATION, fill=(255, 225, 90))
         if self.inset is not None:
             iw, ih = self.inset.size
             x0, y0 = SCENE_W - iw - 16, 104
@@ -233,7 +289,7 @@ def main():
     ap.add_argument("--parts", type=int, default=3)
     ap.add_argument("--offline", action="store_true")
     ap.add_argument("--mistakes", action="store_true")
-    ap.add_argument("--steps-per-frame", type=int, default=60)
+    ap.add_argument("--steps-per-frame", type=int, default=50)
     ap.add_argument("instructions", nargs="*", default=[
         "process all the parts in storage",
         "take the failed part out of the reject bin and ship it"])
