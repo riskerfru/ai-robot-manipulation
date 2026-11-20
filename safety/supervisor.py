@@ -148,6 +148,21 @@ class SafetySupervisor:
         self.denied_count = 0
         self.authorized_count = 0
         self._listeners = []
+        # Where the robot's own base is, as (x, y, yaw) in the world.
+        # None for a robot bolted to the floor at the origin. A mobile
+        # base sets this as it moves, and every limit below is then
+        # checked in the robot's own frame - the workspace and reach
+        # travel with the arm.
+        self.base_pose = None
+
+    def to_base(self, x, y, z):
+        """A world point in the robot's own frame."""
+        if self.base_pose is None:
+            return x, y, z
+        bx, by, yaw = self.base_pose
+        dx, dy = x - bx, y - by
+        c, s = math.cos(-yaw), math.sin(-yaw)
+        return dx * c - dy * s, dx * s + dy * c, z
 
     # ---- listeners (audit trail, agent stop flag) --------------
     def on_trip(self, callback):
@@ -250,6 +265,7 @@ class SafetySupervisor:
 
     def check_point(self, x, y, z):
         """Geometric checks only. Also used to monitor the live TCP."""
+        x, y, z = self.to_base(x, y, z)
         lim = self.limits
         pad = lim.padding
         for axis, v, (lo, hi) in (("x", x, lim.workspace_x),
@@ -276,7 +292,7 @@ class SafetySupervisor:
         Leaving the workspace box or entering a keep-out zone trips a
         protective stop. (Reach limits apply to commanded targets.)
         """
-        x, y, z = position
+        x, y, z = self.to_base(*position)
         lim = self.limits
         for axis, v, (lo, hi) in (("x", x, lim.workspace_x),
                                   ("y", y, lim.workspace_y),
