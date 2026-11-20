@@ -58,7 +58,7 @@ PART_TOLERANCE_MM = 3.0
 # is told these; the camera finds where they really are.
 EQUIPMENT = {
     "MACHINE":  [("fixture", (0.52, 0.00), 0.14, (0.30, 0.32, 0.36))],
-    "INSPECT":  [("pad",     (0.52, -0.17), 0.14, (0.78, 0.78, 0.80)),
+    "INSPECT":  [("pad",     (0.52, -0.17), 0.14, (0.15, 0.16, 0.18)),
                  ("bin",     (0.52, 0.12), 0.22, (0.78, 0.16, 0.16))],
     "DISPATCH": [("tray",    (0.52, 0.00), 0.22, (0.55, 0.36, 0.20))],
 }

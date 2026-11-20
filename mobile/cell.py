@@ -199,7 +199,23 @@ class MobileCell(O.OpenCell):
                     best, best_d = blob, d
             if best is not None:
                 free.remove(best)
-                thing.take(best)
+                if thing.container:
+                    thing.take(best)
+                else:
+                    # A part does not change size. Inside a fixture its
+                    # walls hide part of it, so a fresh view can make it
+                    # look smaller: keep the size measured in the open.
+                    keep = {k: getattr(thing, k) for k in
+                            ("long", "short", "height", "roundness", "fill")}
+                    shrunk = (best.short < keep["short"] - 0.004
+                              or best.long < keep["long"] - 0.004)
+                    old_angle = thing.angle
+                    thing.take(best)
+                    for k, v in keep.items():
+                        setattr(thing, k, v)
+                    thing.ground = thing.top - thing.height
+                    if shrunk:
+                        thing.angle = old_angle
                 claimed[thing.id] = thing
         gone = [i for i in here if i not in claimed]
         for i in gone:
@@ -360,19 +376,37 @@ class MobileCell(O.OpenCell):
         return result
 
     def inspect(self):
-        """Measure the part on the pad with the mast camera."""
+        """
+        Measure the part on the pad with a fresh mast-camera picture.
+        The measurement is only read here; what the arm knows about
+        the part (where to grip it) is left as it was.
+        """
         parts = self.parts_in("pad", "INSPECT")
         if not parts:
             return None
         part = parts[0]
-        dims = sorted([part.long, part.short, part.height])
-        size = sum(dims) / 3 * 1000
+        long_m, short_m = part.long, part.short
+        if self.base.station == "INSPECT" and self.use_vision:
+            self.base.park_for_scan()
+            finder = self._ensure_finder()
+            (x0, x1), (y0, y1) = F.station_rect("INSPECT")
+            blobs, _ = finder.find(area=((x0, x1), (y0, y1)))
+            near = [b for b in blobs if not b.container
+                    and math.hypot(b.x - part.x, b.y - part.y) < 0.04]
+            if near:
+                b = min(near, key=lambda b: math.hypot(b.x - part.x,
+                                                       b.y - part.y))
+                long_m, short_m = b.long, b.short
+        # The longest side seen from above. A part that settles slightly
+        # tilted shows one side foreshortened; the other stays true.
+        size = long_m * 1000
         ok = abs(size - F.NOMINAL_PART_MM) <= F.PART_TOLERANCE_MM
         self.state[part.id] = PASS if ok else FAIL
         self.measured_mm[part.id] = round(size, 1)
         F.set_lamp(self.built, "INSPECT", LAMP["idle" if ok else "fault"])
         return {"part": part.id, "size_mm": round(size, 1),
-                "dims_mm": [round(d * 1000, 1) for d in dims],
+                "dims_mm": [round(long_m * 1000, 1),
+                            round(short_m * 1000, 1)],
                 "result": PASS if ok else FAIL}
 
     def wait_for_machine(self, timeout_s=30.0):

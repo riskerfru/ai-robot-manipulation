@@ -54,15 +54,176 @@ class Panel(RO.Panel):
         return img
 
 
+F_BANNER = RO.font("bold", 30)
+F_BANNER_S = RO.font("bold", 19)
+F_INSET = RO.font("bold", 13)
+RENDER_SCALE = 0.75             # render smaller, scale up: much faster
+
+
 class FollowRecorder(Recorder):
     base = None
+    cell = None
+    shot = "follow"             # or "close" for a station close-up
+    banner = None               # (title, subtitle, colour)
+    inset = None                # mast camera picture, PIL image
+
+    def _view(self):
+        x, y, yaw = self.base.true_pose
+        if self.shot == "close":
+            from mobile.base import compose
+            tx, ty = compose(self.base.true_pose, 0.52, 0.0)
+            return p.computeViewMatrixFromYawPitchRoll(
+                [tx, ty, 0.12], 1.25, -55, -42, 0, 2)
+        return p.computeViewMatrixFromYawPitchRoll(
+            [x + 0.35, y, 0.25], 2.5, -60, -34, 0, 2)
 
     def frame(self):
-        if self.base is not None:
-            x, y, _ = self.base.true_pose
-            self.view = p.computeViewMatrixFromYawPitchRoll(
-                [x + 0.35, y, 0.25], 2.5, -60, -34, 0, 2)
-        super().frame()
+        sw, sh = int(SCENE_W * RENDER_SCALE), int(H * RENDER_SCALE)
+        raw = p.getCameraImage(sw, sh, self._view(), self.proj,
+                               renderer=p.ER_TINY_RENDERER, shadow=1,
+                               lightDirection=[0.6, -0.5, 1.6])
+        import numpy as np
+        scene = Image.fromarray(np.reshape(raw[2], (sh, sw, 4))[:, :, :3]
+                                .astype("uint8")).resize((SCENE_W, H))
+        self._decorate(scene)
+        self.hud.speed = self.steps_per_frame / 240 * 24
+        self.last = self.hud.draw(scene)
+        self._write(self.last)
+
+    def _decorate(self, scene):
+        d = ImageDraw.Draw(scene)
+        if self.inset is not None:
+            iw, ih = self.inset.size
+            x0, y0 = SCENE_W - iw - 16, 104
+            d.rectangle([x0 - 3, y0 - 22, x0 + iw + 3, y0 + ih + 3],
+                        fill=(10, 13, 17))
+            d.text((x0 + 4, y0 - 19), "MAST CAMERA VIEW", font=F_INSET,
+                   fill=CYAN)
+            scene.paste(self.inset, (x0, y0))
+        if self.banner:
+            title, sub, colour = self.banner
+            d.rectangle([0, H - 92, SCENE_W, H], fill=(10, 13, 17))
+            d.rectangle([0, H - 92, 8, H], fill=colour)
+            d.text((26, H - 84), title, font=F_BANNER, fill=colour)
+            d.text((26, H - 42), sub, font=F_BANNER_S, fill=TEXT)
+
+    def mast_picture(self, mark=None, size=300):
+        """What the mast camera sees, with a box round one part."""
+        import numpy as np
+        cam = self.base.camera_config()
+        view = p.computeViewMatrix(cam["position"], cam["target"], [0, 1, 0])
+        proj = p.computeProjectionMatrixFOV(cam.get("fov", 42), 1.0,
+                                            0.05, 3.0)
+        raw = p.getCameraImage(size, size, view, proj,
+                               renderer=p.ER_TINY_RENDERER)
+        img = Image.fromarray(np.reshape(raw[2], (size, size, 4))[:, :, :3]
+                              .astype("uint8"))
+        if mark is not None:
+            V = np.array(view).reshape(4, 4).T
+            P = np.array(proj).reshape(4, 4).T
+            pts = []
+            hx = mark.long / 2 + 0.006
+            for dx in (-hx, hx):
+                for dy in (-hx, hx):
+                    v = P @ V @ np.array([mark.x + dx, mark.y + dy,
+                                          mark.top, 1.0])
+                    v = v[:3] / v[3]
+                    pts.append(((v[0] + 1) / 2 * size,
+                                (1 - v[1]) / 2 * size))
+            xs, ys = [q[0] for q in pts], [q[1] for q in pts]
+            ImageDraw.Draw(img).rectangle(
+                [min(xs), min(ys), max(xs), max(ys)], outline=(255, 220, 0),
+                width=3)
+        return img
+
+
+def hook_stages(rec, cell, base):
+    """Banner and camera for each stage, without touching the logic."""
+    real = {n: getattr(cell, n) for n in ("pick", "place", "inspect",
+                                          "dispatch")}
+    go = base.go_to_station
+
+    def goto(station, *a, **k):
+        rec.shot, rec.inset = "follow", None
+        rec.banner = (f"DRIVING TO {station}",
+                      "parks up to ~15 mm off; the mast camera re-measures "
+                      "on arrival", BLUE)
+        try:
+            return go(station, *a, **k)
+        finally:
+            rec.banner = None
+
+    def pick(thing, *a, **k):
+        st = base.station
+        rec.shot = "close"
+        rec.banner = (f"PICKING PART {thing.id} AT {st}",
+                      "position from the mast camera, not from a map", GREEN)
+        try:
+            return real["pick"](thing, *a, **k)
+        finally:
+            rec.banner = None
+
+    def place(role, *a, **k):
+        held = cell.held()
+        ident = held.id if held else "?"
+        words = {"fixture": ("LOADING THE MACHINE",
+                             f"part {ident} into the fixture - must sit "
+                             f"within 5 mm or the machine will not clamp it"),
+                 "pad": ("INSPECTION",
+                         f"part {ident} onto the measuring pad"),
+                 "bin": ("REJECTED PART",
+                         f"part {ident} into the red reject bin"),
+                 "tray": ("DISPATCH",
+                          f"part {ident} into the outgoing tray "
+                          f"(passed inspection)"),
+                 "table": ("PUTTING DOWN",
+                           f"part {ident} on the table for now")}
+        colour = {"bin": RED, "tray": GREEN, "pad": VIOLET}.get(role, AMBER)
+        title, sub = words.get(role, (role.upper(), ""))
+        rec.shot, rec.banner = "close", (title, sub, colour)
+        try:
+            out = real["place"](role, *a, **k)
+            rec.hold(1.2)
+            return out
+        finally:
+            rec.banner = None
+
+    def inspect(*a, **k):
+        parts = cell.parts_in("pad", "INSPECT")
+        rec.shot = "close"
+        rec.banner = ("INSPECTION", "mast camera measuring the part on the "
+                      "pad...", VIOLET)
+        if parts:
+            rec.inset = rec.mast_picture(parts[0])
+        rec.hold(2.0)
+        r = real["inspect"](*a, **k)
+        if r:
+            ok = r["result"] == "PASS"
+            rec.banner = (f"INSPECTION: PART {r['part']} {r['result']}",
+                          f"measured {r['size_mm']} mm, allowed 44 +/- 3 mm"
+                          + ("  -> goes to DISPATCH" if ok
+                             else "  -> goes to the REJECT BIN"),
+                          GREEN if ok else RED)
+            rec.hold(3.5)
+        rec.banner, rec.inset = None, None
+        return r
+
+    def dispatch(*a, **k):
+        riders = [t.id for t in cell.parts_in("tray", "DISPATCH")]
+        rec.shot = "close"
+        rec.banner = ("DISPATCH: TRAY LEAVING",
+                      f"parts {', '.join(map(str, riders))} - all passed "
+                      f"inspection - out on the conveyor", GREEN)
+        try:
+            n = real["dispatch"](*a, **k)
+            rec.hold(1.5)
+            return n
+        finally:
+            rec.banner = None
+
+    base.go_to_station = goto
+    cell.pick, cell.place = pick, place
+    cell.inspect, cell.dispatch = inspect, dispatch
 
 
 def main():
@@ -108,6 +269,11 @@ def main():
               "The model decides each next action from plain English.",
               "A fixed rule layer - like a PLC - checks every action",
               "first, and refuses any that breaks the process."], 5.0)
+    rec.card("Why it drives back and forth",
+             ["Every part must visit: storage -> machine -> inspection",
+              "-> dispatch. It carries one part at a time, the machine",
+              "takes one part per 15 s cycle, and the robot only sees",
+              "the station it is parked at."], 5.0)
 
     def log(tag, text):
         if tag == "GUARD" and "REJECT" in text:
@@ -128,6 +294,7 @@ def main():
             rec.hold(1.0)
 
     cell.log = log
+    hook_stages(rec, cell, w.base)
     panel.heading = "looking at STORAGE"
     with contextlib.redirect_stdout(io.StringIO()):
         cell.scan()
