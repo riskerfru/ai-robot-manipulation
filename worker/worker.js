@@ -5,6 +5,7 @@
 //
 // Settings (Cloudflare dashboard > the Worker > Settings > Variables and Secrets):
 //   ANTHROPIC_API_KEY  secret, required  - a key from a workspace with a spend limit
+//                      (the name APIKEY is also accepted)
 //   ALLOWED_ORIGIN     text,   required  - e.g. https://riskerfru.github.io
 //   MODEL              text,   optional  - default claude-haiku-4-5
 //   MAX_PER_10_MIN     text,   optional  - planning calls per visitor per 10 min, default 20
@@ -49,7 +50,8 @@ export default {
     if (url.pathname === '/' && request.method === 'GET') return json({ ok: true, service: 'waam-planner' }, 200, cors);
     if (url.pathname !== '/plan' || request.method !== 'POST') return json({ error: 'not found' }, 404, cors);
     if (!originOk) return json({ error: 'origin not allowed' }, 403, cors);
-    if (!env.ANTHROPIC_API_KEY) return json({ error: 'server has no API key set' }, 500, cors);
+    const apiKey = env.ANTHROPIC_API_KEY || env.APIKEY;
+    if (!apiKey) return json({ error: 'server has no API key set' }, 500, cors);
 
     const ip = request.headers.get('CF-Connecting-IP') || 'unknown';
     const now = Date.now();
@@ -68,7 +70,7 @@ export default {
       r = await fetch('https://api.anthropic.com/v1/messages', {
         method: 'POST',
         headers: {
-          'x-api-key': env.ANTHROPIC_API_KEY,
+          'x-api-key': apiKey,
           'anthropic-version': '2023-06-01',
           'content-type': 'application/json',
         },
