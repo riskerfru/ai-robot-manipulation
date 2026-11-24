@@ -1,0 +1,584 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>WAAM Digital Twin</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Barlow+Condensed:wght@600;700&family=Barlow:wght@400;500;600&display=swap" rel="stylesheet">
+<style>
+/* VOICE: a workshop process sheet; engineer to engineer, plain numbers
+   IDEA: the job traveller clipped beside a robotic wire-arc cell
+   PICTURE: the live 3D cell, the arm laying beads that glow and then cool
+   COLOUR and TYPE: steel greys, arc blue for CAD, heat orange; Barlow Condensed + Barlow
+   LAYOUT: cell left, traveller right; heat trace and numbers below; log and data last */
+:root{color-scheme:light dark;--bg:light-dark(#eceeef,#101316);--panel:light-dark(#ffffff,#191d21);--ink:light-dark(#14181c,#e6e9ec);--mute:light-dark(#59636c,#9aa4ad);--line:light-dark(#d4d9dd,#2b3238);--heat:#ff5a1f;--cad:#4fb6e8;--ok:light-dark(#1a7443,#4cc483);--bad:light-dark(#bf2329,#ff6b6b);--chip:light-dark(#f2f4f5,#22282d)}
+:root[data-theme=light]{color-scheme:light}:root[data-theme=dark]{color-scheme:dark}
+*{box-sizing:border-box;min-width:0}
+body{margin:0;background:var(--bg);color:var(--ink);font:16px/1.55 Barlow,system-ui,sans-serif;overflow-x:clip}
+h1,h2,.num{font-family:"Barlow Condensed",Barlow,sans-serif}
+h1{font-size:clamp(32px,4.4vw,48px);line-height:1.05;margin:0 0 8px;text-wrap:balance}
+h2{font-size:24px;line-height:1.1;margin:0 0 10px}
+p{margin:0 0 10px}
+.band{padding:clamp(20px,3vw,40px) max(4vw,16px)}
+.wrap{max-width:1360px;margin:0 auto}
+.lede{max-width:70ch;color:var(--mute);font-size:17px}
+.small{font-size:13px;color:var(--mute)}
+.grid{display:grid;grid-template-columns:minmax(0,1.65fr) minmax(0,1fr);gap:18px;align-items:start}
+.view{position:relative;height:clamp(380px,64vh,700px);background:#14181c;border-radius:10px;overflow:hidden}
+.view canvas{position:absolute;inset:0;width:100%;height:100%;display:block;touch-action:none;cursor:grab}
+.hud{position:absolute;left:12px;top:10px;color:#e8ecef;font:600 15px/1.35 Barlow,sans-serif;text-shadow:0 1px 2px #000;pointer-events:none}
+.hud .big{font:700 26px/1.1 "Barlow Condensed",sans-serif}
+.legend{position:absolute;left:12px;bottom:10px;color:#cfd6dc;font-size:13px;display:flex;gap:14px;flex-wrap:wrap;align-items:center;pointer-events:none}
+.ramp{display:inline-block;width:90px;height:9px;border-radius:5px;background:linear-gradient(90deg,#6d737a,#8a1c0a,#ff5a1f,#ffd37a);vertical-align:middle;margin-right:6px}
+.sw{display:inline-block;width:14px;height:2px;background:var(--cad);vertical-align:middle;margin-right:6px}
+.toggles{position:absolute;right:10px;top:8px;display:flex;gap:6px;flex-wrap:wrap;justify-content:flex-end}
+.toggles label{background:#000a;color:#e8ecef;font-size:13px;padding:4px 9px;border-radius:6px;cursor:pointer;min-height:30px;display:flex;align-items:center;gap:6px}
+.panel{background:var(--panel);border-radius:10px;padding:16px}
+textarea{width:100%;min-height:92px;font:16px/1.45 Barlow,sans-serif;color:var(--ink);background:var(--chip);border:1px solid var(--line);border-radius:8px;padding:10px;resize:vertical}
+textarea:focus,button:focus-visible,select:focus-visible{outline:2px solid var(--cad);outline-offset:2px}
+.chips{display:flex;flex-wrap:wrap;gap:6px;margin:8px 0}
+.chips button{font-size:13px;min-height:36px;background:var(--chip);color:var(--ink);border:1px solid var(--line)}
+button,select{font:600 15px Barlow,sans-serif;border:0;border-radius:8px;padding:8px 14px;min-height:44px;cursor:pointer}
+.go{background:var(--heat);color:#fff}
+.alt{background:var(--chip);color:var(--ink);border:1px solid var(--line)}
+button:disabled{opacity:.45;cursor:not-allowed}
+.row{display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin-top:8px}
+select{background:var(--chip);color:var(--ink);border:1px solid var(--line)}
+.badge{font-size:13px;color:var(--mute);margin-top:6px}
+table{width:100%;border-collapse:collapse;font-size:15px}
+td,th{padding:5px 6px;border-bottom:1px solid var(--line);text-align:left;vertical-align:top}
+th{font-weight:600;color:var(--mute);font-size:13px}
+td.n,th.n{text-align:right;white-space:nowrap}
+.checks{list-style:none;margin:8px 0 0;padding:0}
+.checks li{display:grid;grid-template-columns:22px minmax(0,1fr);gap:6px;padding:5px 0;border-bottom:1px solid var(--line);font-size:14px}
+.checks b{font-weight:600}
+.y{color:var(--ok);font-weight:700}.x{color:var(--bad);font-weight:700}
+.summary{font-size:15px;margin:10px 0 0}
+.lower{display:grid;grid-template-columns:minmax(0,1.65fr) minmax(0,1fr);gap:18px;margin-top:18px}
+.fig{position:relative;min-height:240px}.fig>svg{position:absolute;inset:0;width:100%;height:100%}
+.stats{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px 16px}
+.stats div{border-bottom:1px solid var(--line);padding-bottom:6px}
+.stats .num{font-size:28px;line-height:1.1;white-space:nowrap}
+.stats span{display:block;font-size:13px;color:var(--mute)}
+.log{font:13px/1.45 ui-monospace,Menlo,Consolas,monospace;max-height:300px;overflow:auto;background:var(--chip);border-radius:8px;padding:8px 10px}
+.log div{padding:1px 0;overflow-wrap:anywhere}
+.t-GUARD{color:#d99a00}.t-REFUSED{color:var(--bad);font-weight:700}.t-CLAUDE{color:var(--cad)}.t-THERMAL{color:var(--heat)}.t-DONE{color:var(--ok);font-weight:700}.t-ERROR{color:var(--bad)}
+.dims{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:8px;margin-top:8px}.dims label{font-size:13px;color:var(--mute);display:block}.dims input{width:100%;font:16px Barlow,sans-serif;padding:8px;min-height:42px;border:1px solid var(--line);border-radius:8px;background:var(--chip);color:var(--ink)}summary{cursor:pointer;min-height:32px;display:flex;align-items:center}
+.cols{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:18px}
+ul.plain{margin:0;padding-left:18px}
+.scroll{overflow-x:auto}
+@media(max-width:900px){.grid,.lower,.cols{grid-template-columns:minmax(0,1fr)}}
+@media(max-width:600px){.hud .big{font-size:19px}.hud{right:10px}.toggles{top:auto;bottom:70px}.legend{font-size:12px}.stats .num{font-size:22px;white-space:normal}.view{height:440px}}
+@media(prefers-reduced-motion:reduce){*{scroll-behavior:auto}}
+</style>
+</head>
+<body>
+<header class="band" style="padding-bottom:6px"><div class="wrap">
+<h1>WAAM digital twin</h1>
+<p class="lede">Type what you need. Claude plans a wire-arc build using only tested process data, fixed rules check the plan before anything moves, and a simulated robot lays every bead while a heat model holds each layer to its interpass temperature.</p>
+<p class="small">Simulation only. Process values are illustrative, not calibrated.</p>
+</div></header>
+
+<main class="band" style="padding-top:10px"><div class="wrap">
+<div class="grid">
+ <section>
+  <div class="view" id="view">
+   <canvas id="cv" aria-label="3D view of the robotic WAAM cell"></canvas>
+   <div class="hud" id="hud"><div class="big" id="hudTitle">No plan yet</div><div id="hudLine">Plan a build to begin</div></div>
+   <div class="toggles">
+    <label><input type="checkbox" id="tCad" checked> CAD</label>
+    <label><input type="checkbox" id="tPath" checked> Toolpath</label>
+    <label><input type="checkbox" id="tFollow"> Follow torch</label>
+   </div>
+   <div class="legend"><span><i class="ramp"></i>cool to hot bead</span><span><i class="sw"></i>CAD net shape</span><span>drag to turn, scroll to zoom</span></div>
+  </div>
+  <div class="row">
+   <button class="go" id="runBtn" disabled>Run build</button>
+   <button class="alt" id="pauseBtn" disabled>Pause</button>
+   <button class="alt" id="resetBtn" disabled>Reset</button>
+   <label class="small" for="speed">Speed</label>
+   <select id="speed"><option value="1">1×</option><option value="10">10×</option><option value="30" selected>30×</option><option value="100">100×</option><option value="300">300×</option><option value="1000">1000×</option></select>
+  </div>
+ </section>
+
+ <aside class="panel">
+  <h2>Job traveller</h2>
+  <label for="req" class="small">Operator request</label>
+  <textarea id="req">Build the flanged boss in mild steel. Keep heat input low and leave enough stock to machine the bore and the top face.</textarea>
+  <div class="chips" id="chips"></div>
+  <div class="row">
+   <button class="go" id="planBtn">Plan with Claude</button>
+   <button class="alt" id="unsafeBtn">Try an unsafe plan</button>
+  </div>
+  <div class="badge" id="badge">Checking for Claude…</div>
+  <details id="dimBox" style="margin-top:12px"><summary><b>Your own part sizes (mm)</b></summary>
+   <div class="row"><select id="dimPart" aria-label="Part type"></select><select id="dimMat" aria-label="Material"><option value="steel">Mild steel</option><option value="ss316l">316L stainless</option></select></div>
+   <div class="dims" id="dimFields"></div>
+   <div class="row"><button class="alt" id="dimBtn">Check and use these sizes</button></div>
+   <p class="small" style="margin-top:6px">The rules check your sizes as well as the process settings. This button picks settings without the language model; sizes typed in the request go through Claude.</p>
+  </details>
+  <div id="planBox" style="margin-top:12px"></div>
+  <ul class="checks" id="checks"></ul>
+ </aside>
+</div>
+
+<div class="lower">
+ <section class="panel">
+  <h2>Part temperature during the build</h2>
+  <div class="fig"><svg id="chart" role="img" aria-label="Part temperature over build time"></svg></div>
+  <p class="small">Top-of-part temperature from a lumped heat model. The robot may not start a layer until the part is at or below the interpass limit (dashed line).</p>
+ </section>
+ <section class="panel">
+  <h2>Build numbers</h2>
+  <div class="stats" id="stats"></div>
+ </section>
+</div>
+
+<div class="cols" style="margin-top:18px">
+ <section class="panel">
+  <h2>Event log</h2>
+  <div class="log" id="log" aria-live="polite"></div>
+ </section>
+ <section class="panel">
+  <h2>Tested process data</h2>
+  <div class="scroll" id="proc"></div>
+  <p class="small" style="margin-top:8px">CMT-type wire-arc settings with 1.0 mm wire. Illustrative values for this simulation, not calibrated welding parameters.</p>
+ </section>
+</div>
+
+<section class="panel" style="margin-top:18px">
+ <h2>What this twin does and does not do</h2>
+ <div class="cols">
+  <ul class="plain">
+   <li>Sizes are yours to set: type them in the request or use the size form. A rule checks they make sense and fit the 300 mm build plate.</li>
+   <li>Claude reads the request and picks the part, material, a tested parameter set, the layer height, interpass temperature and machining allowance. It never writes coordinates.</li>
+   <li>Fixed rules (R01–R08) check every plan; a refusal goes back to Claude with the rule and the reason, and it re-plans.</li>
+   <li>A deterministic slicer turns the plan into layers and bead paths: outline then infill on the pad, concentric beads on walls, starts staggered and direction alternated layer to layer.</li>
+   <li>The beads cover the CAD shape plus the machining allowance plus 0.5 mm waviness, because WAAM is near-net shape and is finished by machining.</li>
+  </ul>
+  <ul class="plain">
+   <li>No melt-pool, distortion or residual-stress physics: the heat model is one lumped temperature, for showing the interpass rule at work.</li>
+   <li>The robot is a simple six-axis arm with the torch held vertical; reach is checked with the same arm.</li>
+   <li>The rules are a process check, not a certified safety function.</li>
+   <li>If the planning server is unreachable or its demo limit is reached, a rule-based planner fills in, and the log says so.</li>
+  </ul>
+ </div>
+</section>
+</div></main>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+<script>
+{
+const $=id=>document.getElementById(id);
+/* Address of your planning server (the Cloudflare Worker that holds the API key).
+   Leave it empty to use only the rule-based planner. */
+const PLAN_API='';
+const TA=20,WAVY=0.5,STEP=0.72,KH=6.5,AREA=Math.PI*0.25,THIN=8;
+const ROB={bx:-560,by:0,SH:420,L1:560,L2:520,TORCH:260};
+const HOME=[-200,0,260];
+const MATS={
+ steel:{name:'Mild steel, ER70S-6 wire',rho:7.85,maxI:250,sets:{
+  S1:{wfs:5,ts:8,w:6.0,h:2.2,heat:0.8},S2:{wfs:6.5,ts:8,w:7.0,h:2.5,heat:1.0},
+  S3:{wfs:6.5,ts:12,w:5.6,h:1.9,heat:0.75},S4:{wfs:9,ts:9,w:8.6,h:2.9,heat:1.4}}},
+ ss316l:{name:'Stainless steel, 316L wire',rho:8.0,maxI:150,sets:{
+  N1:{wfs:4.5,ts:7,w:5.6,h:2.1,heat:0.8},N2:{wfs:6,ts:8,w:6.6,h:2.4,heat:1.0},
+  N3:{wfs:6,ts:11,w:5.4,h:1.9,heat:0.75}}}
+};
+const TPL={
+ flanged_boss:{name:'Flanged boss',dims:{pad_L:160,pad_W:100,pad_H:12,boss_OD:70,boss_ID:46,boss_H:60},
+  labels:{pad_L:'Pad length',pad_W:'Pad width',pad_H:'Pad height',boss_OD:'Boss outside Ø',boss_ID:'Boss bore Ø',boss_H:'Boss height above pad'},
+  make:d=>({H:d.pad_H+d.boss_H,desc:`base pad ${d.pad_L} × ${d.pad_W} × ${d.pad_H} mm with a Ø${d.boss_OD} / Ø${d.boss_ID} mm boss rising ${d.boss_H} mm (${d.pad_H+d.boss_H} mm overall)`,
+   f:[{k:'pad',L:d.pad_L,W:d.pad_W,H:d.pad_H,r:4,z0:0},{k:'ring',OD:d.boss_OD,ID:d.boss_ID,z0:d.pad_H,H:d.boss_H,inPad:true}]})},
+ thin_cylinder:{name:'Cylinder (tube)',dims:{OD:120,wall:4,H:100},labels:{OD:'Outside Ø',wall:'Wall thickness',H:'Height'},
+  make:d=>({H:d.H,desc:`Ø${d.OD} mm outside, ${d.wall} mm wall, ${d.H} mm tall`,f:[{k:'ring',OD:d.OD,ID:d.OD-2*d.wall,z0:0,H:d.H}]})},
+ box_wall:{name:'Rectangular box wall',dims:{L:150,W:90,wall:8,H:70,r:10},labels:{L:'Outside length',W:'Outside width',wall:'Wall thickness',H:'Height',r:'Outer corner radius'},
+  make:d=>({H:d.H,desc:`${d.L} × ${d.W} mm outside, ${d.wall} mm wall, ${d.H} mm tall, ${d.r} mm outer corner radius`,f:[{k:'rtube',L:d.L,W:d.W,t:d.wall,r:d.r,z0:0,H:d.H}]})}
+};
+function partOf(pl){const t=TPL[pl.part];if(!t)return null;const d=Object.assign({},t.dims,pl.dims||{});const p=t.make(d);p.name=t.name;p.dims=d;return p}
+const PLATE=270,MAXH=300;
+function dimCheck(kind,d){
+ for(const[k,v]of Object.entries(d))if(!Number.isFinite(v)||v<(k==='r'?0:0.5))return `${TPL[kind].labels[k]} must be a positive number`;
+ if(kind==='flanged_boss'){if(d.boss_ID>=d.boss_OD)return 'the bore must be smaller than the boss';if((d.boss_OD-d.boss_ID)/2<2)return 'boss wall under 2 mm';
+  if(d.boss_OD>Math.min(d.pad_L,d.pad_W))return 'the boss is wider than the pad';if(Math.max(d.pad_L,d.pad_W)>PLATE)return `pad over ${PLATE} mm does not fit the 300 mm plate`;if(d.pad_H<3)return 'pad under 3 mm';if(d.pad_H+d.boss_H>MAXH)return `taller than ${MAXH} mm`}
+ if(kind==='thin_cylinder'){if(d.wall<2)return 'wall under 2 mm';if(d.OD-2*d.wall<10)return 'bore under 10 mm';if(d.OD>PLATE)return `over ${PLATE} mm does not fit the 300 mm plate`;if(d.H>MAXH)return `taller than ${MAXH} mm`}
+ if(kind==='box_wall'){if(d.wall<2)return 'wall under 2 mm';if(Math.max(d.L,d.W)>PLATE)return `over ${PLATE} mm does not fit the 300 mm plate`;if(Math.min(d.L,d.W)<2*d.wall+10)return 'too small for its wall';if(d.r>Math.min(d.L,d.W)/2)return 'corner radius too large';if(d.H>MAXH)return `taller than ${MAXH} mm`}
+ return ''}
+const CHIPS=[
+ 'Build the flanged boss in mild steel. Keep heat input low and leave enough stock to machine the bore and the top face.',
+ 'Make the thin-wall cylinder in 316L stainless, as fast as the rules allow.',
+ 'Build the rectangular box wall in mild steel with the least material to machine off.',
+ 'Make a Ø150 mm tube with a 6 mm wall, 80 mm tall, in mild steel.',
+ 'Same part, but faster.'
+];
+const f1=x=>(Math.round(x*10)/10).toFixed(1);
+const fmtT=s=>{s=Math.round(s);const h=Math.floor(s/3600),m=Math.floor(s%3600/60),c=s%60;return h?`${h} h ${String(m).padStart(2,'0')} min`:m?`${m} min ${String(c).padStart(2,'0')} s`:`${c} s`};
+const rrArea=(L,W,r)=>L*W-(4-Math.PI)*r*r;
+const wallT=f=>f.k==='ring'?(f.OD-f.ID)/2:f.t;
+function cadVol(p){let v=0;for(const f of p.f){if(f.k==='pad')v+=rrArea(f.L,f.W,f.r)*f.H;else if(f.k==='ring')v+=Math.PI/4*(f.OD**2-f.ID**2)*f.H;else v+=(rrArea(f.L,f.W,f.r)-rrArea(f.L-2*f.t,f.W-2*f.t,Math.max(f.r-f.t,0)))*f.H}return v}
+function wallBeads(t,set,a){const w=set.w,s=STEP*w,need=t+2*(a+WAVY);const n=need<=w?1:Math.ceil((need-w)/s-1e-9)+1;const W=w+(n-1)*s;return{n,W,s,side:(W-t)/2-WAVY}}
+
+/* ---------- geometry of paths (part frame, mm, z up) ---------- */
+function circle(R,th){const n=Math.max(24,Math.ceil(2*Math.PI*R/5)),p=[];for(let i=0;i<=n;i++){const a=th+2*Math.PI*i/n;p.push([R*Math.cos(a),R*Math.sin(a)])}return p}
+function rrect(Lx,Wy,r,frac){r=Math.min(r,Lx/2-0.5,Wy/2-0.5);r=Math.max(r,0.5);const ax=Lx/2-r,ay=Wy/2-r,p=[],seg=5;
+ const line=(x0,y0,x1,y1)=>{const n=Math.max(1,Math.ceil(Math.hypot(x1-x0,y1-y0)/seg));for(let i=0;i<n;i++)p.push([x0+(x1-x0)*i/n,y0+(y1-y0)*i/n])};
+ const arc=(cx,cy,a0)=>{const n=Math.max(2,Math.ceil(r*Math.PI/2/seg));for(let i=0;i<n;i++){const a=a0+Math.PI/2*i/n;p.push([cx+r*Math.cos(a),cy+r*Math.sin(a)])}};
+ line(Lx/2,-ay,Lx/2,ay);arc(ax,ay,0);line(ax,Wy/2,-ax,Wy/2);arc(-ax,ay,Math.PI/2);line(-Lx/2,ay,-Lx/2,-ay);arc(-ax,-ay,Math.PI);line(-ax,-Wy/2,ax,-Wy/2);arc(ax,-ay,1.5*Math.PI);
+ const k=Math.floor(((frac%1)+1)%1*p.length);const q=p.slice(k).concat(p.slice(0,k));q.push(q[0].slice());return q}
+function densify(pts,seg){const o=[pts[0]];for(let i=1;i<pts.length;i++){const a=pts[i-1],b=pts[i],n=Math.max(1,Math.ceil(Math.hypot(b[0]-a[0],b[1]-a[1])/seg));for(let j=1;j<=n;j++)o.push([a[0]+(b[0]-a[0])*j/n,a[1]+(b[1]-a[1])*j/n])}return o}
+function padPasses(f,k,w,s,a,infill){
+ const e=a+WAVY,Lx=f.L+2*e,Wy=f.W+2*e,rr=f.r+e,out=[rrect(Lx-w,Wy-w,Math.max(rr-w/2,2),(k*0.27)%1)];
+ if(infill==='contour'){for(let o=w/2+s;;o+=s){const lx=Lx-2*o,wy=Wy-2*o;if(lx<s||wy<s)break;out.push(rrect(lx,wy,Math.max(rr-o,1.5),(k*0.27)%1))}return out}
+ const hx=Lx/2-w/2-s,hy=Wy/2-w/2-s,alongX=k%2===0,A=alongX?hx:hy,B=alongX?hy:hx,m=Math.max(2,Math.floor(2*B/s)+1),z=[];
+ for(let i=0;i<m;i++){const c=-B+2*B*i/(m-1),row=i%2?[[A,c],[-A,c]]:[[-A,c],[A,c]];for(const q of row)z.push(alongX?q:[q[1],q[0]])}
+ out.push(densify(z,5));return out}
+function buildLayout(pl){
+ const part=partOf(pl),set=MATS[pl.material].sets[pl.param_set],lh=pl.layer_height_mm,a=pl.allowance_side_mm,at=pl.allowance_top_mm,w=set.w,s=STEP*w;
+ const stg=(Number(pl.start_stagger_deg)||0)*Math.PI/180,alt=pl.alternate_direction!==false,n=Math.ceil((part.H+at)/lh-1e-6),layers=[];
+ for(let k=0;k<n&&k<400;k++){
+  const z=(k+1)*lh,zm=z-lh/2,passes=[];
+  const padOn=part.f.some(f=>f.k==='pad'&&zm>=f.z0&&zm<f.z0+f.H+at);
+  for(const f of part.f){
+   if(zm<f.z0||zm>=f.z0+f.H+at)continue;
+   if(f.inPad&&padOn)continue;
+   if(f.k==='pad')passes.push(...padPasses(f,k,w,s,a,pl.pad_infill));
+   else if(f.k==='ring'){const b=wallBeads(wallT(f),set,a),mid=(f.OD+f.ID)/4;for(let j=0;j<b.n;j++)passes.push(circle(mid-b.W/2+w/2+j*b.s,k*stg))}
+   else{const b=wallBeads(f.t,set,a);for(let j=0;j<b.n;j++){const o=-b.W/2+w/2+j*b.s;passes.push(rrect(f.L-f.t+2*o,f.W-f.t+2*o,Math.max(f.r-f.t/2+o,1),k*stg/(2*Math.PI)))}}
+  }
+  if(alt&&k%2)for(const p of passes)p.reverse();
+  layers.push({k,z,passes});
+ }
+ return{layers,set,w,h:set.h}}
+function reachOf(x,y,z){const dx=x-ROB.bx,dy=y-ROB.by,r=Math.hypot(dx,dy),h=z+ROB.TORCH-ROB.SH,d=Math.hypot(r,h);return{d,ok:d<=ROB.L1+ROB.L2-5&&d>=Math.abs(ROB.L1-ROB.L2)+5}}
+
+/* ---------- the guardian: fixed rules ---------- */
+function guard(pl){
+ const out=[],add=(c,n,ok,why)=>out.push({c,n,ok,why});
+ const part=partOf(pl),mat=MATS[pl.material],set=mat&&mat.sets[pl.param_set];
+ const nums=['layer_height_mm','interpass_C','allowance_side_mm','allowance_top_mm'].every(k=>Number.isFinite(pl[k]))&&pl.layer_height_mm>0.5;
+ add('R01','PLAN_COMPLETE',!!part&&!!mat&&nums,!part?`no part "${pl.part}" in the catalogue`:!mat?`no material "${pl.material}"`:!nums?'a number is missing or not usable':'part, material and numbers present');
+ add('R02','PARAMS_TESTED',!!set,set?`${pl.param_set} is a tested set for ${mat.name}`:`"${pl.param_set}" is not a tested set${mat?' for '+mat.name:''}`);
+ if(!part||!mat||!set||!nums)return out;
+ const de=dimCheck(pl.part,part.dims);add('R09','DIMENSIONS_FIT',!de,de?`${part.name}: ${de}`:`${part.desc}; fits the 300 × 300 mm plate`);
+ if(de)return out;
+ const lh=pl.layer_height_mm,okL=Math.abs(lh-set.h)<=0.1*set.h+1e-9;
+ add('R03','LAYER_MATCHES_BEAD',okL,`${f1(lh)} mm layer, ${f1(set.h)} mm bead${okL?'':'; must be within 10%'}`);
+ const ip=pl.interpass_C,okI=ip>=60&&ip<=mat.maxI;
+ add('R04','INTERPASS_LIMIT',okI,`${Math.round(ip)} °C; allowed 60–${mat.maxI} °C for this material`);
+ const a=pl.allowance_side_mm,at=pl.allowance_top_mm,okA=a>=1&&a<=3&&at>=2&&at<=5;
+ add('R05','ALLOWANCE_RANGE',okA,`${f1(a)} mm per side and ${f1(at)} mm on top; allowed 1–3 and 2–5 mm`);
+ let wOk=true,hOk=true;const ww=[],hw=[];
+ for(const f of part.f){if(f.k==='pad')continue;const t=wallT(f),b=wallBeads(t,set,a);if(b.side>3+1e-9)wOk=false;ww.push(`${t} mm wall: ${b.n} bead${b.n>1?'s':''}, ${f1(b.side)} mm stock per side`);if(t<=THIN&&set.heat>1){hOk=false;hw.push(`${t} mm wall with heat ${set.heat}`)}}
+ add('R06','WALL_STOCK',wOk,(ww.join('; ')||'solid areas only')+(wOk?'':'; more than 3.0 mm to machine off'));
+ add('R07','THIN_WALL_HEAT',hOk,hOk?'heat input suits the walls':hw.join('; ')+'; walls of 8 mm or less need heat 1.0 or lower');
+ const lay=buildLayout(pl);let worst=0,bad=0;
+ for(const L of lay.layers)for(const ps of L.passes)for(const p of ps){const r=reachOf(p[0],p[1],L.z);if(!r.ok)bad++;worst=Math.max(worst,r.d)}
+ add('R08','REACH',bad===0,bad?`${bad} path points out of the arm's reach`:`farthest point ${Math.round(worst)} mm, reach ${ROB.L1+ROB.L2-5} mm`);
+ return out}
+
+/* ---------- log ---------- */
+function log(tag,text){const d=document.createElement('div');d.className='t-'+tag;d.textContent=`${S.t>0?'['+fmtT(S.t)+'] ':''}${tag.padEnd(8)} ${text}`;const L=$('log');L.prepend(d);while(L.children.length>250)L.lastChild.remove()}
+
+/* ---------- 3D scene ---------- */
+const S={plan:null,run:false,t:0,T:TA,speed:30,moves:[],mi:0,pi:0,segPos:0,layer:0,arc:false,tip:HOME.slice(),shown:0,arcT:0,wait:0,waits:0,starts:0,Tmax:TA,samples:[],lastSample:-99,waiting:false,lay:null,ranges:[],done:false};
+const P=(x,y,z)=>new THREE.Vector3(x,z,-y);
+let R3=null;
+function initScene(){
+ if(!window.THREE){$('hudTitle').textContent='3D view unavailable';$('hudLine').textContent='The 3D library did not load. Plans and checks still work.';return}
+ const cv=$('cv'),view=$('view');
+ const renderer=new THREE.WebGLRenderer({canvas:cv,antialias:true});renderer.setPixelRatio(Math.min(devicePixelRatio,2));
+ const scene=new THREE.Scene();scene.background=new THREE.Color(0x14181c);scene.fog=new THREE.Fog(0x14181c,2600,5200);
+ const cam=new THREE.PerspectiveCamera(38,1,5,9000);
+ scene.add(new THREE.HemisphereLight(0xdfe8f0,0x202428,0.75));
+ const sun=new THREE.DirectionalLight(0xffffff,0.75);sun.position.set(-600,1400,900);scene.add(sun);
+ const arcLight=new THREE.PointLight(0x9fd8ff,0,700);scene.add(arcLight);
+ const mStd=(c,r=0.6,m=0.3)=>new THREE.MeshStandardMaterial({color:c,roughness:r,metalness:m});
+ const floor=new THREE.Mesh(new THREE.PlaneGeometry(4000,4000),mStd(0x1c2126,0.95,0));floor.rotation.x=-Math.PI/2;floor.position.y=-220;scene.add(floor);
+ const grid=new THREE.GridHelper(4000,40,0x2c343b,0x232a30);grid.position.y=-219;scene.add(grid);
+ const table=new THREE.Mesh(new THREE.BoxGeometry(420,200,420),mStd(0x30373e,0.8,0.2));table.position.y=-120;scene.add(table);
+ const plate=new THREE.Mesh(new THREE.BoxGeometry(320,20,320),mStd(0x5f666d,0.55,0.6));plate.position.y=-10;scene.add(plate);
+ const robot=new THREE.Group();scene.add(robot);
+ const rob=mStd(0xd9dde0,0.5,0.25),dark=mStd(0x2a2f35,0.6,0.4);
+ const ped=new THREE.Mesh(new THREE.CylinderGeometry(95,120,ROB.SH+200,32),dark);ped.position.copy(P(ROB.bx,ROB.by,(ROB.SH-200)/2-20));robot.add(ped);
+ const cyl=(r,m)=>{const g=new THREE.Mesh(new THREE.CylinderGeometry(r,r,1,24),m);robot.add(g);return g};
+ const ball=(r,m)=>{const g=new THREE.Mesh(new THREE.SphereGeometry(r,24,16),m);robot.add(g);return g};
+ const J={sh:ball(66,dark),el:ball(50,dark),wr:ball(34,dark),up:cyl(44,rob),fo:cyl(34,rob),to:cyl(13,dark)};
+ const nozzle=new THREE.Mesh(new THREE.ConeGeometry(18,46,20),mStd(0xb87333,0.4,0.8));nozzle.rotation.x=Math.PI;robot.add(nozzle);
+ const glow=new THREE.Mesh(new THREE.SphereGeometry(7,16,12),new THREE.MeshBasicMaterial({color:0xdff4ff}));scene.add(glow);
+ const cad=new THREE.Group();scene.add(cad);
+ const path=new THREE.Group();scene.add(path);
+ R3={renderer,scene,cam,arcLight,J,nozzle,glow,cad,path,beads:null,orbit:{az:0.95,el:0.34,dist:1250,tx:-130,ty:90,tz:0}};
+ const ro=new ResizeObserver(()=>{const w=view.clientWidth,h=view.clientHeight;renderer.setSize(w,h,false);cam.aspect=w/h;cam.updateProjectionMatrix()});ro.observe(view);
+ let drag=null;
+ cv.addEventListener('pointerdown',e=>{drag={x:e.clientX,y:e.clientY};cv.setPointerCapture(e.pointerId);cv.style.cursor='grabbing'});
+ cv.addEventListener('pointermove',e=>{if(!drag)return;const o=R3.orbit;o.az-=(e.clientX-drag.x)*0.006;o.el=Math.min(1.45,Math.max(0.05,o.el+(e.clientY-drag.y)*0.005));drag={x:e.clientX,y:e.clientY}});
+ const up=()=>{drag=null;cv.style.cursor='grab'};cv.addEventListener('pointerup',up);cv.addEventListener('pointercancel',up);
+ cv.addEventListener('wheel',e=>{e.preventDefault();R3.orbit.dist=Math.min(4200,Math.max(350,R3.orbit.dist*(1+e.deltaY*0.0012)))},{passive:false});
+ cv.addEventListener('dblclick',()=>Object.assign(R3.orbit,{az:0.95,el:0.34,dist:1250}));
+ poseRobot(HOME);
+}
+function linkBetween(m,a,b){const d=b.clone().sub(a),L=d.length();m.position.copy(a).addScaledVector(d,0.5);m.scale.set(1,Math.max(L,1e-3),1);m.quaternion.setFromUnitVectors(new THREE.Vector3(0,1,0),d.normalize())}
+function poseRobot(tip){
+ if(!R3)return;const[x,y,z]=tip,wx=x,wy=y,wz=z+ROB.TORCH,dx=wx-ROB.bx,dy=wy-ROB.by,r=Math.max(Math.hypot(dx,dy),1),h=wz-ROB.SH;
+ const d=Math.min(Math.max(Math.hypot(r,h),Math.abs(ROB.L1-ROB.L2)+1),ROB.L1+ROB.L2-1),phi=Math.atan2(h,r);
+ const al=Math.acos(Math.min(1,Math.max(-1,(ROB.L1**2+d*d-ROB.L2**2)/(2*ROB.L1*d)))),s=phi+al,ux=dx/r,uy=dy/r;
+ const Sh=P(ROB.bx,ROB.by,ROB.SH),El=P(ROB.bx+ux*ROB.L1*Math.cos(s),ROB.by+uy*ROB.L1*Math.cos(s),ROB.SH+ROB.L1*Math.sin(s)),Wr=P(wx,wy,wz),Tp=P(x,y,z+40);
+ const J=R3.J;J.sh.position.copy(Sh);J.el.position.copy(El);J.wr.position.copy(Wr);linkBetween(J.up,Sh,El);linkBetween(J.fo,El,Wr);linkBetween(J.to,Wr,Tp);
+ R3.nozzle.position.copy(P(x,y,z+23));R3.glow.position.copy(P(x,y,z+2));R3.arcLight.position.copy(P(x,y,z+30))}
+function clearGroup(g){while(g.children.length){const c=g.children.pop();c.geometry&&c.geometry.dispose()}}
+function drawCad(part){
+ if(!R3)return;clearGroup(R3.cad);const mat=new THREE.LineBasicMaterial({color:0x4fb6e8,transparent:true,opacity:0.7});
+ const add=(geo,y)=>{const e=new THREE.LineSegments(new THREE.EdgesGeometry(geo,20),mat);e.position.y=y;R3.cad.add(e);geo.dispose()};
+ const rshape=(L,W,r)=>{const s=new THREE.Shape(),x=L/2,y=W/2;s.moveTo(-x+r,-y);s.lineTo(x-r,-y);s.absarc(x-r,-y+r,r,-Math.PI/2,0);s.lineTo(x,y-r);s.absarc(x-r,y-r,r,0,Math.PI/2);s.lineTo(-x+r,y);s.absarc(-x+r,y-r,r,Math.PI/2,Math.PI);s.lineTo(-x,-y+r);s.absarc(-x+r,-y+r,r,Math.PI,1.5*Math.PI);return s};
+ for(const f of part.f){
+  if(f.k==='pad'){const g=new THREE.ExtrudeGeometry(rshape(f.L,f.W,f.r),{depth:f.H,bevelEnabled:false,curveSegments:6});g.rotateX(-Math.PI/2);add(g,f.z0)}
+  else if(f.k==='ring'){const ri=f.ID/2,ro=f.OD/2,g=new THREE.LatheGeometry([new THREE.Vector2(ri,0),new THREE.Vector2(ro,0),new THREE.Vector2(ro,f.H),new THREE.Vector2(ri,f.H),new THREE.Vector2(ri,0)],48);add(g,f.z0)}
+  else{const s=rshape(f.L,f.W,f.r),hole=rshape(f.L-2*f.t,f.W-2*f.t,Math.max(f.r-f.t,0.5));s.holes.push(hole);const g=new THREE.ExtrudeGeometry(s,{depth:f.H,bevelEnabled:false,curveSegments:6});g.rotateX(-Math.PI/2);add(g,f.z0)}
+ }
+ R3.cad.visible=$('tCad').checked}
+function drawPath(L){
+ if(!R3)return;clearGroup(R3.path);if(!L)return;const mat=new THREE.LineBasicMaterial({color:0xffb08a,transparent:true,opacity:0.55});
+ for(const ps of L.passes){const g=new THREE.BufferGeometry().setFromPoints(ps.map(p=>P(p[0],p[1],L.z+0.6)));R3.path.add(new THREE.Line(g,mat))}
+ R3.path.visible=$('tPath').checked}
+const C_STEEL=[0.43,0.45,0.48];
+function heatRGB(T){const st=[[150,C_STEEL],[420,[0.54,0.11,0.04]],[650,[1,0.35,0.12]],[900,[1,0.83,0.48]]];if(T<=st[0][0])return st[0][1];for(let i=1;i<st.length;i++)if(T<=st[i][0]){const[a,c0]=st[i-1],[b,c1]=st[i],u=(T-a)/(b-a);return c0.map((v,j)=>v+(c1[j]-v)*u)}return st[3][1]}
+
+/* ---------- compile a plan into robot moves and bead instances ---------- */
+function compile(pl){
+ const lay=buildLayout(pl),set=lay.set,moves=[],mats=[],ranges=[];let cur=HOME.slice();
+ const has3=!!window.THREE,UP=has3?new THREE.Vector3(0,1,0):null,m=has3?new THREE.Matrix4():null;
+ for(const L of lay.layers){
+  moves.push({t:'wait',k:L.k});const st=mats.length;
+  for(const ps of L.passes){
+   const p0=[ps[0][0],ps[0][1],L.z],lift=Math.max(cur[2],L.z)+20;
+   moves.push({t:'move',arc:false,sp:120,k:L.k,pts:[cur,[cur[0],cur[1],lift],[p0[0],p0[1],L.z+20],p0]});
+   const base=mats.length,zc=L.z-lay.h/2;
+   for(let i=1;i<ps.length;i++){if(!has3){mats.push(null);continue}const A=P(ps[i-1][0],ps[i-1][1],zc),B=P(ps[i][0],ps[i][1],zc),d=B.clone().sub(A),len=d.length();
+    if(len<1e-6){d.set(1,0,0)}else d.normalize();const side=d.clone().cross(UP).normalize();
+    m.makeBasis(side,d,UP);m.scale(new THREE.Vector3(lay.w/2,len+lay.w*0.35,lay.h/2));m.setPosition(A.clone().add(B).multiplyScalar(0.5));mats.push(m.clone())}
+   moves.push({t:'move',arc:true,sp:set.ts,k:L.k,base,pts:ps.map(q=>[q[0],q[1],L.z])});
+   cur=[ps[ps.length-1][0],ps[ps.length-1][1],L.z]}
+  ranges.push([st,mats.length])}
+ moves.push({t:'move',arc:false,sp:150,k:-1,pts:[cur,[cur[0],cur[1],cur[2]+60],HOME]});moves.push({t:'done'});
+ return{lay,moves,mats,ranges}}
+function stats(pl){
+ const lay=buildLayout(pl),set=lay.set,mat=MATS[pl.material];let len=0,passes=0;
+ for(const L of lay.layers)for(const ps of L.passes){passes++;for(let i=1;i<ps.length;i++)len+=Math.hypot(ps[i][0]-ps[i-1][0],ps[i][1]-ps[i-1][1])}
+ const arc=len/set.ts,dep=set.wfs*1000/60*arc*AREA*mat.rho/1e6,fin=cadVol(partOf(pl))*mat.rho/1e6;
+ return{layers:lay.layers.length,passes,len,arc,dep,fin,btf:dep/fin}}
+
+/* ---------- simulation ---------- */
+function resetSim(){
+ Object.assign(S,{run:false,t:0,T:TA,mi:0,pi:0,segPos:0,layer:0,arc:false,tip:HOME.slice(),shown:0,arcT:0,wait:0,waits:0,starts:0,Tmax:TA,samples:[{t:0,T:TA}],lastSample:0,waiting:false,done:false});
+ if(S.plan){const c=compile(S.plan);S.moves=c.moves;S.lay=c.lay;S.ranges=c.ranges;
+  if(R3){if(R3.beads){R3.scene.remove(R3.beads);R3.beads.geometry.dispose()}
+   const g=new THREE.CylinderGeometry(1,1,1,10,1),mesh=new THREE.InstancedMesh(g,new THREE.MeshStandardMaterial({roughness:0.55,metalness:0.55}),Math.max(1,c.mats.length));
+   const col=new THREE.Color(...C_STEEL);c.mats.forEach((mm,i)=>{mesh.setMatrixAt(i,mm);mesh.setColorAt(i,col)});mesh.count=0;mesh.frustumCulled=false;R3.scene.add(mesh);R3.beads=mesh;
+   drawPath(S.lay.layers[0])}}
+ poseRobot(HOME);if(R3){R3.arcLight.intensity=0;R3.glow.visible=false}
+ $('pauseBtn').textContent='Pause';$('pauseBtn').disabled=true;$('runBtn').disabled=!S.plan;$('resetBtn').disabled=!S.plan;
+ drawChart();renderStats();hud()}
+function heatStep(dt,arcOn){const set=MATS[S.plan.material].sets[S.plan.param_set];let left=dt;while(left>1e-9){const h=Math.min(0.5,left),tau=90+1.2*S.layer;S.T+=((arcOn?KH*set.heat:0)-(S.T-TA)/tau)*h;left-=h}
+ S.Tmax=Math.max(S.Tmax,S.T);if(S.t+dt-S.lastSample>=5){S.samples.push({t:S.t+dt,T:S.T});S.lastSample=S.t+dt}}
+function onLayer(k){S.layer=k;const L=S.lay.layers[k];drawPath(L);
+ log('ROBOT',`Layer ${k+1} of ${S.lay.layers.length} started at ${Math.round(S.T)} °C (${L.passes.length} pass${L.passes.length>1?'es':''}, top at ${f1(L.z)} mm)`);
+ if(R3&&R3.beads&&k>=12){const[a,b]=S.ranges[k-12],c=new THREE.Color(...C_STEEL);for(let i=a;i<b;i++)R3.beads.setColorAt(i,c);R3.beads.instanceColor.needsUpdate=true}}
+function step(dtReal){
+ if(!S.run)return;let budget=dtReal*S.speed,guardLoop=0;
+ while(budget>1e-6&&S.mi<S.moves.length&&guardLoop++<2000){
+  const mv=S.moves[S.mi];
+  if(mv.t==='done'){finish();return}
+  if(mv.t==='wait'){
+   if(S.T>S.plan.interpass_C){if(!S.waiting){S.waiting=true;S.wStart=S.t;S.waits++;log('THERMAL',`Layer ${mv.k+1} held: part at ${Math.round(S.T)} °C, above the ${S.plan.interpass_C} °C interpass limit. Robot waits.`)}
+    S.arc=false;const d=Math.min(budget,1);heatStep(d,false);S.wait+=d;S.t+=d;budget-=d;continue}
+   if(S.waiting){log('THERMAL',`Cooled to ${Math.round(S.T)} °C after ${fmtT(S.t-S.wStart)}.`);S.waiting=false}
+   onLayer(mv.k);S.mi++;S.pi=0;S.segPos=0;continue}
+  const d=Math.min(budget,0.5);let dist=mv.sp*d;
+  while(dist>0&&S.pi<mv.pts.length-1){const a=mv.pts[S.pi],b=mv.pts[S.pi+1],L=Math.hypot(b[0]-a[0],b[1]-a[1],b[2]-a[2]),rem=L-S.segPos;
+   if(dist>=rem){dist-=rem;S.pi++;S.segPos=0;if(mv.arc)S.shown=mv.base+S.pi}else{S.segPos+=dist;dist=0}}
+  const used=Math.max(0,d-dist/mv.sp);
+  if(S.pi<mv.pts.length-1){const a=mv.pts[S.pi],b=mv.pts[S.pi+1],L=Math.hypot(b[0]-a[0],b[1]-a[1],b[2]-a[2])||1,u=S.segPos/L;S.tip=[a[0]+(b[0]-a[0])*u,a[1]+(b[1]-a[1])*u,a[2]+(b[2]-a[2])*u];S.arc=mv.arc}
+  else{S.tip=mv.pts[mv.pts.length-1].slice();S.arc=false;if(mv.arc)S.starts++;S.mi++;S.pi=0;S.segPos=0}
+  heatStep(used,mv.arc);S.t+=used;if(mv.arc)S.arcT+=used;budget-=used;if(used<=0&&dist<=0)budget-=1e-3}}
+function finish(){S.run=false;S.done=true;S.arc=false;poseRobot(HOME);
+ if(R3){const c=new THREE.Color(...C_STEEL);for(let i=0;i<R3.beads.count;i++)R3.beads.setColorAt(i,c);R3.beads.instanceColor.needsUpdate=true;R3.arcLight.intensity=0;R3.glow.visible=false;drawPath(null)}
+ const st=stats(S.plan);
+ log('DONE',`Build complete: ${S.lay.layers.length} layers, ${S.starts} arc starts, ${fmtT(S.arcT)} arc-on, ${fmtT(S.wait)} waiting for cooling, ${fmtT(S.t)} in total. ${f1(st.dep)} kg deposited for a ${f1(st.fin)} kg machined part. Next step in a real cell: scan, then finish-machine.`);
+ $('pauseBtn').disabled=true;$('runBtn').disabled=false;$('runBtn').textContent='Run again';drawChart();renderStats();hud()}
+
+/* ---------- HUD, numbers, chart ---------- */
+function hud(){
+ if(!S.plan){$('hudTitle').textContent='No plan yet';$('hudLine').textContent='Plan a build to begin';return}
+ const n=S.lay?S.lay.layers.length:0,state=S.done?'finished':!S.run&&S.t===0?'ready':!S.run?'paused':S.waiting?'waiting for interpass temperature':S.arc?'depositing':'moving';
+ $('hudTitle').textContent=`${partOf(S.plan).name} · layer ${Math.min(S.layer+1,n)} of ${n}`;
+ $('hudLine').textContent=`${Math.round(S.T)} °C · ${state} · ${fmtT(S.t)}`}
+function renderStats(){
+ if(!S.plan){$('stats').innerHTML='<p class="small">Numbers appear once a plan is accepted.</p>';return}
+ const st=stats(S.plan),set=MATS[S.plan.material].sets[S.plan.param_set],done=S.done,
+  dep=set.wfs*1000/60*S.arcT*AREA*MATS[S.plan.material].rho/1e6;
+ const items=[[`${st.layers}`,'layers'],[`${st.passes}`,'bead passes (arc starts)'],[`${f1(st.len/1000)} m`,'bead path'],[`${fmtT(S.arcT)} / ${fmtT(st.arc)}`,'arc-on time, done / planned'],
+  [`${fmtT(S.wait)}`,`waiting to cool (${S.waits} hold${S.waits===1?'':'s'})`],[`${fmtT(S.t)}`,done?'total build time':'build time so far'],
+  [`${f1(dep)} / ${f1(st.dep)} kg`,'metal deposited, done / planned'],[`${f1(st.btf)} : 1`,`buy-to-fly (${f1(st.fin)} kg final part)`]];
+ $('stats').innerHTML=items.map(([v,l])=>`<div><div class="num">${v}</div><span>${l}</span></div>`).join('')}
+const chart=$('chart');
+function drawChart(){
+ const W=chart.clientWidth,H=chart.clientHeight;if(!W||!H)return;const pad={l:44,r:12,t:12,b:26},sm=W<520;
+ const tmax=Math.max(60,S.t,S.samples.length?S.samples[S.samples.length-1].t:0),Tm=Math.max(400,Math.ceil((S.Tmax+60)/100)*100);
+ const X=t=>pad.l+(W-pad.l-pad.r)*t/tmax,Y=T=>H-pad.b-(H-pad.t-pad.b)*T/Tm;
+ let g='';for(let T=0;T<=Tm;T+=100)g+=`<line x1="${pad.l}" x2="${W-pad.r}" y1="${Y(T)}" y2="${Y(T)}" stroke="var(--line)"/><text x="${pad.l-6}" y="${Y(T)+4}" text-anchor="end" font-size="12" fill="var(--mute)">${T}</text>`;
+ const tick=tmax>7200?1800:tmax>2400?600:tmax>600?120:30;if(!sm)for(let t=0;t<=tmax;t+=tick)g+=`<text x="${X(t)}" y="${H-6}" text-anchor="middle" font-size="12" fill="var(--mute)">${Math.round(t/60)} min</text>`;
+ if(S.plan){const y=Y(S.plan.interpass_C);g+=`<line x1="${pad.l}" x2="${W-pad.r}" y1="${y}" y2="${y}" stroke="var(--bad)" stroke-dasharray="6 5"/><text x="${W-pad.r-4}" y="${y-6}" text-anchor="end" font-size="12" fill="var(--bad)">interpass limit ${S.plan.interpass_C} °C</text>`}
+ const sp=S.samples,step=Math.max(1,Math.ceil(sp.length/700));let d='';for(let i=0;i<sp.length;i+=step)d+=(d?'L':'M')+X(sp[i].t).toFixed(1)+' '+Y(sp[i].T).toFixed(1);
+ if(S.run&&sp.length)d+='L'+X(S.t).toFixed(1)+' '+Y(S.T).toFixed(1);
+ g+=`<path d="${d}" fill="none" stroke="var(--heat)" stroke-width="2"/><text x="${pad.l+4}" y="${pad.t+12}" font-size="12" fill="var(--mute)">°C</text>`;
+ chart.innerHTML=g}
+const cro=new ResizeObserver(drawChart);cro.observe(chart);
+
+/* ---------- plan display ---------- */
+function showPlan(pl,checks,who){
+ const box=$('planBox'),ok=checks.every(c=>c.ok),part=partOf(pl),mat=MATS[pl.material],set=mat&&mat.sets[pl.param_set];
+ const rows=[['Part',part?`${part.name}: ${part.desc}`:String(pl.part)],['Material',mat?mat.name:String(pl.material)],
+  ['Parameter set',set?`${pl.param_set}: wire ${set.wfs} m/min, travel ${set.ts} mm/s, bead ${f1(set.w)} × ${f1(set.h)} mm`:String(pl.param_set)],
+  ['Layer height',`${f1(pl.layer_height_mm)} mm`],['Interpass limit',`${pl.interpass_C} °C`],['Machining stock',`${f1(pl.allowance_side_mm)} mm per side, ${f1(pl.allowance_top_mm)} mm on top`],
+  ['Pad infill',pl.pad_infill||'raster'],['Layer to layer',`${pl.alternate_direction===false?'same direction':'direction alternates'}, starts staggered ${Number(pl.start_stagger_deg)||0}°`]];
+ const t=document.createElement('table');for(const[k,v]of rows){const tr=t.insertRow();const a=tr.insertCell(),b=tr.insertCell();a.textContent=k;a.style.color='var(--mute)';a.style.whiteSpace='nowrap';b.textContent=v}
+ box.innerHTML='';const h=document.createElement('div');h.className='small';h.textContent=`${who} · ${ok?'accepted by the rules':'refused by the rules'}`;box.append(h,t);
+ if(pl.summary){const p=document.createElement('p');p.className='summary';p.textContent=pl.summary;box.append(p)}
+ $('checks').innerHTML='';for(const c of checks){const li=document.createElement('li'),s=document.createElement('span'),d=document.createElement('div'),b=document.createElement('b');
+  s.className=c.ok?'y':'x';s.textContent=c.ok?'✓':'✗';b.textContent=`${c.c} ${c.n}`;d.append(b,document.createTextNode(` · ${c.why}`));li.append(s,d);$('checks').append(li)}}
+function acceptPlan(pl){S.plan=pl;drawCad(partOf(pl));fillForm(pl.part,partOf(pl).dims);$('dimMat').value=pl.material;resetSim();$('runBtn').textContent='Run build';
+ const st=stats(pl);log('GUARD',`Plan accepted: ${st.layers} layers, ${st.passes} passes, ${f1(st.len/1000)} m of bead, about ${fmtT(st.arc)} of arc time.`)}
+
+/* ---------- planners ---------- */
+async function callPlanner(messages){
+ let r;try{r=await fetch(PLAN_API.replace(/\/$/,'')+'/plan',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({messages})})}
+ catch(e){throw{code:'unavailable',message:'planning server unreachable'}}
+ const d=await r.json().catch(()=>({}));
+ if(r.status===429)throw{code:'rate_limited',message:d.error||'demo limit reached'};
+ if(!r.ok||typeof d.text!=='string')throw{code:'unavailable',message:d.error||('server error '+r.status)};
+ return{text:d.text}}
+let sample=PLAN_API?callPlanner:null;
+function normalise(o){const n=k=>{const v=Number(o[k]);return Number.isFinite(v)?v:NaN};
+ const dims={};if(o.dims&&typeof o.dims==='object'&&TPL[o.part])for(const k of Object.keys(TPL[o.part].dims))if(o.dims[k]!==undefined&&Number.isFinite(Number(o.dims[k])))dims[k]=Number(o.dims[k]);
+ return{dims,part:String(o.part||''),material:String(o.material||''),param_set:String(o.param_set||'').toUpperCase(),layer_height_mm:n('layer_height_mm'),interpass_C:n('interpass_C'),
+  allowance_side_mm:n('allowance_side_mm'),allowance_top_mm:n('allowance_top_mm'),pad_infill:o.pad_infill==='contour'?'contour':'raster',alternate_direction:o.alternate_direction!==false,
+  start_stagger_deg:Number(o.start_stagger_deg)||0,summary:String(o.summary||'').slice(0,400)}}
+function prompt(req){
+ const parts=Object.entries(TPL).map(([k,t])=>`- ${k}: ${t.name}; dims keys and defaults (mm): ${JSON.stringify(t.dims)}`).join('\n');
+ const mats=Object.entries(MATS).map(([k,m])=>`- ${k} (${m.name}; interpass max ${m.maxI} °C): `+Object.entries(m.sets).map(([id,s])=>`${id} wire ${s.wfs} m/min, travel ${s.ts} mm/s, bead ${s.w} x ${s.h} mm, heat ${s.heat}`).join('; ')).join('\n');
+ return `You plan robotic wire-arc additive manufacturing (WAAM) builds for a simulated cell. Choose only from the data below; never invent process parameters or coordinates. A slicer makes the toolpath from your plan.
+
+PART TYPES (CAD, mm). If the operator gives sizes, put them in "dims" with these keys; leave out any size not given and the default is used. Map words to keys: diameter or Ø = OD (outside), bore = ID, tall or high = H.
+${parts}
+
+MATERIALS and TESTED parameter sets:
+${mats}
+
+Your plan is checked by fixed rules before anything moves:
+R02 the parameter set must be one listed for the chosen material
+R03 layer height within 10% of the chosen bead height
+R04 interpass temperature from 60 °C to the material maximum
+R05 machining stock 1.0-3.0 mm per side and 2-5 mm on top
+R06 walls get as many beads as needed (step-over 72% of bead width) to cover the wall plus stock plus 0.5 mm waviness; the stock left per side must not exceed 3.0 mm
+R07 walls 8 mm thick or less need heat 1.0 or lower
+R08 every point within the robot's reach
+R09 the part must make sense and fit the plate: at most 270 mm across, 300 mm tall, walls at least 2 mm
+Lower heat and lower interpass mean longer waits; faster travel at the same wire feed gives a smaller bead.
+
+${S.plan?'Current accepted plan (change it if the request asks for a change):\n'+JSON.stringify(S.plan)+'\n\n':''}Operator request: ${req}
+
+Reply with JSON only, no other text:
+{"part":"flanged_boss|thin_cylinder|box_wall","dims":{"OD":150,"wall":6,"H":80},"material":"steel|ss316l","param_set":"S1","layer_height_mm":2.2,"interpass_C":200,"allowance_side_mm":1.5,"allowance_top_mm":3,"pad_infill":"raster|contour","alternate_direction":true,"start_stagger_deg":90,"summary":"one sentence for the operator on why this plan"}`}
+function parseJSON(t){const a=t.indexOf('{'),b=t.lastIndexOf('}');if(a<0||b<a)throw new Error('no JSON in the reply');return JSON.parse(t.slice(a,b+1))}
+function refusalText(checks){return 'The rules refused your plan:\n'+checks.filter(c=>!c.ok).map(c=>`${c.c} ${c.n}: ${c.why}`).join('\n')+'\nReturn a corrected plan as JSON only.'}
+function dimsFromText(part,q){const d={},num='(\\d+(?:\\.\\d+)?)',g=re=>{const m=q.match(re);return m?Number(m[1]):undefined},put=(k,v)=>{if(v!==undefined)d[k]=v};
+ const wall=g(new RegExp(num+'\\s*mm\\s*(?:thick\\s*)?wall'))??g(new RegExp('wall(?:\\s*thickness)?\\s*(?:of\\s*)?'+num)),
+  H=g(new RegExp(num+'\\s*mm\\s*(?:tall|high)'))??g(new RegExp('(?:height|tall|high)\\s*(?:of\\s*)?'+num)),
+  dia=g(new RegExp('(?:ø|⌀|dia(?:meter)?|od)\\s*(?:of\\s*)?'+num))??g(new RegExp(num+'\\s*mm\\s*(?:outside\\s*)?(?:dia|ø|diameter|od)')),
+  lw=q.match(new RegExp(num+'\\s*(?:mm\\s*)?[x×]\\s*'+num));
+ if(part==='thin_cylinder'){put('OD',dia);put('wall',wall);put('H',H)}
+ if(part==='box_wall'){if(lw){d.L=Number(lw[1]);d.W=Number(lw[2])}put('wall',wall);put('H',H)}
+ if(part==='flanged_boss'){if(lw){d.pad_L=Number(lw[1]);d.pad_W=Number(lw[2])}put('boss_OD',dia);put('boss_ID',g(new RegExp('bore\\s*(?:of\\s*)?(?:ø|⌀)?\\s*'+num)));put('boss_H',H)}
+ return d}
+function detPlan(part,dims,material,fast,infill){
+ const mat=MATS[material],ids=Object.keys(mat.sets).sort((a,b)=>fast?mat.sets[b].wfs-mat.sets[a].wfs:mat.sets[a].heat-mat.sets[b].heat);let first=null;
+ for(const id of ids)for(const a of[1.5,1.0,2.0,2.5]){const s=mat.sets[id],pl={part,dims,material,param_set:id,layer_height_mm:s.h,interpass_C:Math.min(200,mat.maxI-30),allowance_side_mm:a,allowance_top_mm:3,pad_infill:infill||'raster',alternate_direction:true,start_stagger_deg:90,
+  summary:`Rule-based choice for ${(partOf({part,dims})||{desc:part}).desc}: ${id}, the ${fast?'highest-deposition':'lowest-heat'} tested set that passes every rule.`};
+  const ch=guard(pl);if(!first)first={pl,checks:ch};if(ch.every(c=>c.ok))return{pl,checks:ch}}
+ return first}
+function rulePlanner(req){
+ const q=req.toLowerCase(),part=/cylind|tube|pipe/.test(q)?'thin_cylinder':/box|rect/.test(q)?'box_wall':/boss|flange/.test(q)?'flanged_boss':(S.plan?S.plan.part:'flanged_boss');
+ const material=/stainless|316/.test(q)?'ss316l':/steel|mild/.test(q)?'steel':(S.plan?S.plan.material:'steel');
+ let dims=dimsFromText(part,q);if(S.plan&&S.plan.part===part&&!Object.keys(dims).length)dims=Object.assign({},partOf(S.plan).dims);
+ return detPlan(part,dims,material,/fast|quick|speed/.test(q),/contour/.test(q)?'contour':'raster')}
+async function plan(req,seed){
+ $('planBtn').disabled=$('unsafeBtn').disabled=true;S.run=false;
+ log('OPERATOR',req);
+ try{
+  if(seed){const ch=guard(seed);showPlan(seed,ch,'Injected unsafe plan');log('PLAN','Injected an unsafe plan to test the rules.');
+   for(const c of ch)if(!c.ok)log('REFUSED',`${c.c} ${c.n}: ${c.why}`);
+   if(ch.every(c=>c.ok)){acceptPlan(seed);return}
+   log('GUARD','Nothing moves. '+(sample?'Sending the refusals to Claude to correct.':'Planning again with the rule-based planner.'))}
+  if(!sample){const r=rulePlanner(req);showPlan(r.pl,r.checks,'Rule-based planner (no language model)');
+   if(r.checks.every(c=>c.ok)){log('PLAN',r.pl.summary);acceptPlan(r.pl)}else{for(const c of r.checks)if(!c.ok)log('REFUSED',`${c.c} ${c.n}: ${c.why}`);log('GUARD','No tested setting passes every rule for this request; nothing moves.')}return}
+  const msgs=[{role:'user',content:prompt(req)}];if(seed){msgs.push({role:'assistant',content:JSON.stringify(seed)},{role:'user',content:refusalText(guard(seed))})}
+  for(let attempt=1;attempt<=4;attempt++){
+   $('badge').textContent=`Claude is planning (attempt ${attempt})…`;
+   const res=await sample(msgs,{modelTier:'default',cache:false});let pl;
+   try{pl=normalise(parseJSON(res.text))}catch(e){log('ERROR',`Reply not usable (${e.message}); asking again.`);msgs.push({role:'assistant',content:res.text},{role:'user',content:'Reply with the JSON object only.'});continue}
+   const ch=guard(pl);showPlan(pl,ch,`Claude, attempt ${attempt}`);
+   log('CLAUDE',`${pl.part}, ${pl.material} ${pl.param_set}, ${f1(pl.layer_height_mm)} mm layers, ${pl.interpass_C} °C interpass, ${f1(pl.allowance_side_mm)}/${f1(pl.allowance_top_mm)} mm stock. ${pl.summary}`);
+   if(ch.every(c=>c.ok)){acceptPlan(pl);return}
+   for(const c of ch)if(!c.ok)log('REFUSED',`${c.c} ${c.n}: ${c.why}`);
+   log('GUARD','Plan refused; nothing moves. Reasons sent back to Claude.');
+   msgs.push({role:'assistant',content:res.text},{role:'user',content:refusalText(ch)})}
+  log('ERROR','Claude could not produce a plan that passes the rules in four attempts. Nothing was built.')
+ }catch(e){
+  if(e&&(e.code==='unavailable'||e.code==='rate_limited')){log('ERROR',`Claude is not reachable right now (${e.message}); using the rule-based planner for this request.`);const keep=sample;sample=null;try{await plan(req,null)}finally{sample=keep}return}
+  log('ERROR',`Planning failed: ${e&&e.message||e}`)}
+ finally{$('planBtn').disabled=$('unsafeBtn').disabled=false;badge()}}
+function badge(){$('badge').textContent=sample?'Claude plans; fixed rules check every plan before the robot moves. No sign-in needed.':'No planning server is set up, so a rule-based planner (no language model) fills in.';$('planBtn').textContent=sample?'Plan with Claude':'Plan (rule-based)'}
+
+/* ---------- wiring ---------- */
+$('chips').innerHTML='';CHIPS.forEach(c=>{const b=document.createElement('button');b.type='button';b.textContent=c.length>48?c.slice(0,46)+'…':c;b.title=c;b.addEventListener('click',()=>{$('req').value=c});$('chips').append(b)});
+$('proc').innerHTML='<table><thead><tr><th>Set</th><th>Material</th><th class="n">Wire m/min</th><th class="n">Travel mm/s</th><th class="n">Bead w × h mm</th><th class="n">Heat</th></tr></thead><tbody>'+
+ Object.values(MATS).flatMap(m=>Object.entries(m.sets).map(([id,s])=>`<tr><td>${id}</td><td>${m.name.split(',')[0]}</td><td class="n">${s.wfs}</td><td class="n">${s.ts}</td><td class="n">${f1(s.w)} × ${f1(s.h)}</td><td class="n">${s.heat}</td></tr>`)).join('')+'</tbody></table>';
+$('planBtn').addEventListener('click',()=>plan($('req').value.trim()||CHIPS[0],null));
+$('unsafeBtn').addEventListener('click',()=>plan('Build the thin-wall cylinder in mild steel, fast.',{part:'thin_cylinder',material:'steel',param_set:'S4',layer_height_mm:3.5,interpass_C:400,allowance_side_mm:0.5,allowance_top_mm:1,pad_infill:'raster',alternate_direction:false,start_stagger_deg:0,summary:'Injected for testing: hot, fast, too little stock.'}));
+$('runBtn').addEventListener('click',()=>{if(S.done||S.t>0)resetSim();S.run=true;$('pauseBtn').disabled=false;$('runBtn').disabled=true;log('ROBOT',`Build started: ${partOf(S.plan).name}, ${S.plan.param_set}.`)});
+$('pauseBtn').addEventListener('click',()=>{if(S.done)return;S.run=!S.run;$('pauseBtn').textContent=S.run?'Pause':'Resume'});
+$('resetBtn').addEventListener('click',()=>{resetSim();log('ROBOT','Reset to an empty plate.')});
+$('speed').addEventListener('change',e=>{S.speed=Number(e.target.value)});
+$('tCad').addEventListener('change',e=>{if(R3)R3.cad.visible=e.target.checked});
+$('tPath').addEventListener('change',e=>{if(R3)R3.path.visible=e.target.checked});
+
+function fillForm(kind,dims){$('dimPart').value=kind;const t=TPL[kind];$('dimFields').innerHTML='';
+ for(const[k,lab]of Object.entries(t.labels)){const w=document.createElement('div'),l=document.createElement('label'),i=document.createElement('input');i.type='number';i.step='0.5';i.min='0';i.inputMode='decimal';i.id='dim_'+k;i.value=dims[k];l.htmlFor=i.id;l.textContent=lab;w.append(l,i);$('dimFields').append(w)}}
+$('dimPart').innerHTML=Object.entries(TPL).map(([k,t])=>`<option value="${k}">${t.name}</option>`).join('');
+$('dimPart').addEventListener('change',e=>fillForm(e.target.value,TPL[e.target.value].dims));
+fillForm('flanged_boss',TPL.flanged_boss.dims);
+$('dimBtn').addEventListener('click',()=>{const kind=$('dimPart').value,dims={},material=$('dimMat').value;for(const k of Object.keys(TPL[kind].dims))dims[k]=Number($('dim_'+k).value);
+ S.run=false;log('OPERATOR',`Custom sizes: ${TPL[kind].name} ${JSON.stringify(dims)}, ${MATS[material].name}`);
+ const r=detPlan(kind,dims,material,false);showPlan(r.pl,r.checks,'Your sizes, rule-based settings');
+ if(r.checks.every(c=>c.ok)){log('PLAN',r.pl.summary);acceptPlan(r.pl)}else{for(const c of r.checks)if(!c.ok)log('REFUSED',`${c.c} ${c.n}: ${c.why}`);log('GUARD','Sizes refused; nothing moves. Change them and check again.')}});
+initScene();renderStats();drawChart();
+let last=performance.now(),acc=0;
+function frame(now){
+ const dt=Math.min(0.05,(now-last)/1000);last=now;step(dt);
+ if(R3){
+  if(R3.beads){R3.beads.count=Math.max(R3.beads.count,Math.min(S.shown,R3.beads.instanceMatrix.count));
+   if(S.run||S.done===false){const k=S.layer,lo=Math.max(0,k-11);for(let j=lo;j<=k&&j<S.ranges.length;j++){const[a,b]=S.ranges[j],T=TA+(S.T-TA)*Math.exp(-(k-j)*S.lay.h/10),c=new THREE.Color(...heatRGB(T+(j===k&&S.arc?250:0)));for(let i=a;i<b&&i<R3.beads.count;i++)R3.beads.setColorAt(i,c)}if(R3.beads.instanceColor)R3.beads.instanceColor.needsUpdate=true}}
+  poseRobot(S.tip);R3.glow.visible=S.arc;R3.arcLight.intensity=S.arc?0.7+Math.random()*0.4:0;R3.glow.scale.setScalar(S.arc?0.8+Math.random()*0.5:1);
+  const o=R3.orbit;if($('tFollow').checked&&S.plan){const t=P(S.tip[0],S.tip[1],S.tip[2]);o.tx+=(t.x-o.tx)*0.08;o.ty+=(t.y-o.ty)*0.08;o.tz+=(t.z-o.tz)*0.08}else{o.tx+=(-130-o.tx)*0.05;o.ty+=(90-o.ty)*0.05;o.tz+=(0-o.tz)*0.05}
+  R3.cam.position.set(o.tx+o.dist*Math.cos(o.el)*Math.cos(o.az),o.ty+o.dist*Math.sin(o.el),o.tz+o.dist*Math.cos(o.el)*Math.sin(o.az));R3.cam.lookAt(o.tx,o.ty,o.tz);
+  R3.renderer.render(R3.scene,R3.cam)}
+ acc+=dt;if(acc>0.4){acc=0;hud();if(S.run){renderStats();drawChart()}}
+ requestAnimationFrame(frame)}
+requestAnimationFrame(frame);
+badge();
+log('ROBOT','Cell ready. Empty build plate, arm at home.');
+}
+</script>
+</body>
+</html>
