@@ -31,6 +31,9 @@ python -m mobile.eval_inspection                 # inspection gauge study
 python record_mobile.py                          # film it (needs ffmpeg)
 ```
 
+No PyBullet window (WSL)? `python run_mobile.py --web` and open
+http://localhost:8090 for a live view, the log and the part states.
+
 While typing: `!lock MACHINE`, `!unlock MACHINE`, `!debris MACHINE`
 (a chip in the fixture the camera cannot see), `!clear MACHINE`,
 `!status`, `quit`. Questions and follow-up orders can refer to earlier

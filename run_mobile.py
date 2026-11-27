@@ -25,6 +25,11 @@
 #                                                 is rejected on doubt
 #   python run_mobile.py --gui --ideal-camera     perfect pictures (no
 #                                                 camera noise)
+#   python run_mobile.py --web                    no window: watch it in
+#                                                 a browser at
+#                                                 http://localhost:8090
+#                                                 (for WSL, where the
+#                                                 PyBullet window fails)
 #
 #   While typing:  !lock MACHINE   !unlock MACHINE   (operator lockout)
 #                  !debris MACHINE  a chip in the fixture the camera
@@ -82,6 +87,9 @@ def main():
     ap.add_argument("--dead-reckoning", action="store_true",
                     help="aim from the map, not the mast camera")
     ap.add_argument("--no-colour", action="store_true")
+    ap.add_argument("--web", action="store_true",
+                    help="serve a live view on http://localhost:8090")
+    ap.add_argument("--port", type=int, default=8090)
     ap.add_argument("--ideal-camera", action="store_true",
                     help="no camera noise (perfect rendered pictures)")
     ap.add_argument("--near-limit", type=float, default=None,
@@ -110,7 +118,13 @@ def main():
             timeout=max(90.0, cfg.AI.get("timeout_s", 90.0))))
 
     start = time.time()
-    log = make_log(start, colour=not args.no_colour)
+    term_log = make_log(start, colour=not args.no_colour)
+    sinks = []
+
+    def log(tag, text):
+        term_log(tag, text)
+        for sink in sinks:
+            sink(tag, text)
     print("Building the shop floor...", flush=True)
     with contextlib.redirect_stdout(io.StringIO()):
         w = build_mobile_cell(gui=args.gui, seed=args.seed, parts=args.parts,
@@ -119,6 +133,13 @@ def main():
                               near_limit_mm=args.near_limit)
         w.cell.scan()
     cell = w.cell
+    view = None
+    if args.web:
+        from mobile.web_view import WebView
+        view = WebView(cell, port=args.port)
+        sinks.append(view.log)
+        print(f"Live view: {view.start()}  (open it in your browser)",
+              flush=True)
     log("CAMERA", "mast camera at STORAGE: " + ", ".join(
         f"part #{t.id} ({t.long * 1000:.0f} mm)"
         for t in cell.at_station() if not t.container))
@@ -169,13 +190,19 @@ def main():
 
     for text in args.instructions:
         one(text)
-    if args.instructions:
+    if args.instructions and not args.web:
         return
     while True:
         try:
+            if view:
+                view.idle = True
+                view.render()
             text = input("instruction> ")
         except (EOFError, KeyboardInterrupt):
             break
+        finally:
+            if view:
+                view.idle = False
         if text.strip().lower() in ("quit", "exit", "q"):
             break
         one(text)
