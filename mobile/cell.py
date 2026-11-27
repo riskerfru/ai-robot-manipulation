@@ -74,10 +74,34 @@ class _StepHub:
         return cls.installed
 
 
+# A real camera: see ObjectFinder.noise. Depth noise is for a D415-class
+# stereo camera about 1 m from the table.
+CAMERA_NOISE = {"gain": 0.06, "tint": 0.03, "rgb_sigma": 0.02,
+                "depth_m_at_1m": 0.0010, "frames": 4}
+INSPECT_FRAMES = 5          # pictures averaged per inspection
+INSPECT_MAX_FRAMES = 15     # more if the result is too close to call
+# Inspection gauge. The longest side comes from the extent of the
+# part's top face, which reads slightly large, more so when the part sits
+# turned against the pixel grid. It is corrected with
+#     size = extent + a + b * (|cos t| + |sin t| - 1)
+# where t is the measured angle; a and b were fitted on reference cubes
+# of known size (41-48 mm, ten angles, random positions on the pad) and
+# checked on sizes left out of the fit (eval_inspection.py):
+#   noisy camera: a -0.810, b -2.251; on unseen sizes mean +0.03 mm,
+#                 spread 0.17 mm (1 sigma), worst 0.47 mm
+#   ideal camera: a -0.587, b -2.473; on unseen sizes mean +0.04 mm,
+#                 spread 0.18 mm (1 sigma), worst 0.58 mm
+# Calibrate the camera you actually use: the two differ.
+GAUGE = {True: (-0.810, -2.251, 0.17), False: (-0.587, -2.473, 0.18)}
+MIN_PART_M = 0.012          # a part stands at least this tall
+JAM_M = 0.0025              # contact this far above expected = blocked
+
+
 class MobileCell(O.OpenCell):
 
     def __init__(self, robot, supervised, base, built, gui=False,
-                 use_vision=True, log=None):
+                 use_vision=True, log=None, camera_noise=False,
+                 noise_seed=0):
         super().__init__(robot, built, gui=gui)
         self.supervised = supervised
         self.base = base
@@ -93,6 +117,12 @@ class MobileCell(O.OpenCell):
         self.hub.callbacks[:] = [self._tick]     # one cell per process
         self.placements = []            # error records, for the numbers
         self.dispatched = 0
+        self.camera_noise = camera_noise
+        self.noise_rng = np.random.default_rng(noise_seed + 7)
+        self.inspections = {}           # part id -> measurement record
+        self.blocked = set()            # (station, role) felt blocked
+        self.debris = {}                # (station, role) -> body id
+        self.force_log = []             # every force-checked place
         for st in F.STATIONS:
             F.set_lamp(built, st, LAMP["idle"])
 
@@ -160,6 +190,9 @@ class MobileCell(O.OpenCell):
                                                 "mast")
         if self.finder is None:
             self.finder = ObjectFinder(self.robot.camera, "mast")
+            self.finder.min_part_m = MIN_PART_M
+            if self.camera_noise:
+                self.finder.noise = dict(CAMERA_NOISE, rng=self.noise_rng)
         return self.finder
 
     def scan(self):
@@ -350,12 +383,26 @@ class MobileCell(O.OpenCell):
                 spot = self.base.dead_reckoned(nx, ny)
         touch = surface + thing.hold
         self.base.tuck()
+        checked = role in ("fixture", "pad")
         result = self.supervised.place_by_touch(
             spot[0], spot[1], touch,
             finger_axis="x" if long_one else "y", strict=long_one,
             open_to=min(0.04, thing.grip / 2 + 0.012),
-            label=f"{role} at {station}")
+            label=f"{role} at {station}",
+            jam_m=JAM_M if checked else None, need_contact=checked)
+        if "force_n" in result:
+            self.force_log.append({
+                "station": station, "role": role,
+                "status": result.get("status"),
+                "force_n": result.get("force_n"),
+                "offset_mm": round(1000 * (result.get("contact_z", 0)
+                                           - result.get("expected_z", 0)), 1)})
         if result.get("status") != "success":
+            if result.get("jam") or result.get("felt_contact") is False:
+                self.blocked.add((station, role))
+                F.set_lamp(self.built, station, LAMP["fault"])
+                self.log("FORCE", f"{role} at {station} flagged BLOCKED: "
+                                  f"{result.get('detail')}")
             return result
         self.note_placed(thing, spot[0], spot[1], surface, inside=inside)
         thing.station = station
@@ -385,29 +432,71 @@ class MobileCell(O.OpenCell):
         if not parts:
             return None
         part = parts[0]
-        long_m, short_m = part.long, part.short
+        # The longest side seen from above. A part that settles slightly
+        # tilted shows one side foreshortened; the other stays true.
+        longs, shorts = [], []
+        verdict = None
         if self.base.station == "INSPECT" and self.use_vision:
             self.base.park_for_scan()
             finder = self._ensure_finder()
             (x0, x1), (y0, y1) = F.station_rect("INSPECT")
-            blobs, _ = finder.find(area=((x0, x1), (y0, y1)))
-            near = [b for b in blobs if not b.container
-                    and math.hypot(b.x - part.x, b.y - part.y) < 0.04]
-            if near:
-                b = min(near, key=lambda b: math.hypot(b.x - part.x,
-                                                       b.y - part.y))
-                long_m, short_m = b.long, b.short
-        # The longest side seen from above. A part that settles slightly
-        # tilted shows one side foreshortened; the other stays true.
-        size = long_m * 1000
-        ok = abs(size - F.NOMINAL_PART_MM) <= F.PART_TOLERANCE_MM
+            for frame in range(INSPECT_MAX_FRAMES):
+                blobs, _ = finder.find(area=((x0, x1), (y0, y1)))
+                near = [b for b in blobs if not b.container
+                        and math.hypot(b.x - part.x, b.y - part.y) < 0.04]
+                if near:
+                    b = min(near, key=lambda b: math.hypot(b.x - part.x,
+                                                           b.y - part.y))
+                    longs.append(self.gauge_mm(b))
+                    shorts.append(b.short * 1000)
+                if len(longs) >= INSPECT_FRAMES:
+                    verdict = self._conformance(longs)
+                    if verdict["decision"] != "DOUBT":
+                        break
+        if not longs:
+            longs, shorts = [part.long * 1000], [part.short * 1000]
+        verdict = self._conformance(longs)
+        ok = verdict["decision"] == "PASS"
+        size = verdict["mean_mm"]
         self.state[part.id] = PASS if ok else FAIL
         self.measured_mm[part.id] = round(size, 1)
+        self.inspections[part.id] = dict(verdict, part=part.id)
         F.set_lamp(self.built, "INSPECT", LAMP["idle" if ok else "fault"])
         return {"part": part.id, "size_mm": round(size, 1),
-                "dims_mm": [round(long_m * 1000, 1),
-                            round(short_m * 1000, 1)],
+                "dims_mm": [round(size, 1),
+                            round(float(np.mean(shorts)), 1)],
+                "frames": verdict["frames"], "sd_mm": verdict["sd_mm"],
+                "U_mm": verdict["U_mm"],
+                "doubt": verdict["decision"] == "DOUBT",
                 "result": PASS if ok else FAIL}
+
+    def gauge_mm(self, blob):
+        """Calibrated longest side of a part, in mm (see GAUGE)."""
+        a, b, _ = GAUGE[bool(self.camera_noise)]
+        t = blob.angle % (math.pi / 2)
+        return (blob.long * 1000 + a
+                + b * (abs(math.cos(t)) + abs(math.sin(t)) - 1))
+
+    def _conformance(self, longs):
+        """
+        Decide PASS / FAIL with the measurement uncertainty taken into
+        account (the guard-band rule of ISO 14253-1): a part passes only
+        if it is inside tolerance by more than the uncertainty, fails if
+        it is outside by more than it, and in between it is DOUBT,
+        which is rejected: conformance has to be shown, not assumed.
+        """
+        n = len(longs)
+        mean = float(np.mean(longs))
+        sd = float(np.std(longs, ddof=1)) if n > 1 else 0.0
+        u_cal = GAUGE[bool(self.camera_noise)][2]
+        u = math.sqrt((sd / math.sqrt(n)) ** 2 + u_cal ** 2)
+        U = 2.0 * u                                  # about 95 %
+        dev = abs(mean - F.NOMINAL_PART_MM)
+        tol = F.PART_TOLERANCE_MM
+        decision = ("PASS" if dev <= tol - U else
+                    "FAIL" if dev > tol + U else "DOUBT")
+        return {"decision": decision, "mean_mm": round(mean, 2),
+                "sd_mm": round(sd, 2), "U_mm": round(U, 2), "frames": n}
 
     def wait_for_machine(self, timeout_s=30.0):
         start = self.now
@@ -451,6 +540,42 @@ class MobileCell(O.OpenCell):
         self.robot._sync_obstacles()
         return len(riders)
 
+    def inject_debris(self, station="MACHINE", role="fixture",
+                      height_m=0.006):
+        """
+        A small chip left in a fitting, the colour of the fitting so the
+        mast camera does not pick it out. Only the force check finds it.
+        """
+        body = self.built["equipment"].get((station, role))
+        if body is None or (station, role) in self.debris:
+            return False
+        (lo, hi) = p.getAABB(body)
+        cx, cy = (lo[0] + hi[0]) / 2, (lo[1] + hi[1]) / 2
+        rgba = p.getVisualShapeData(body)[0][7]
+        half = [0.006, 0.006, height_m / 2]
+        col = p.createCollisionShape(p.GEOM_BOX, halfExtents=half)
+        vis = p.createVisualShape(p.GEOM_BOX, halfExtents=half,
+                                  rgbaColor=rgba)
+        chip = p.createMultiBody(0.02, col, vis, [cx, cy, hi[2] + 0.01])
+        for _ in range(120):
+            p.stepSimulation()
+        self.debris[(station, role)] = chip
+        return True
+
+    def clear_fitting(self, station, role=None):
+        """Operator clears a fitting the force check flagged."""
+        cleared = []
+        for key in [k for k in set(self.debris) | set(self.blocked)
+                    if k[0] == station and (role is None or k[1] == role)]:
+            body = self.debris.pop(key, None)
+            if body is not None:
+                p.removeBody(body)
+            self.blocked.discard(key)
+            cleared.append(key[1])
+        if station not in self.locked:
+            F.set_lamp(self.built, station, LAMP["idle"])
+        return cleared
+
     def lockout(self, station, on=True):
         if on:
             self.locked.add(station)
@@ -472,7 +597,8 @@ class MobileCell(O.OpenCell):
 
 def build_mobile_cell(logger=None, gui=False, seed=0, parts=4,
                       bad_part=True, use_vision=True, log=None,
-                      docking_error_m=0.015, follow_camera=None):
+                      docking_error_m=0.015, follow_camera=None,
+                      camera_noise=False, near_limit_mm=None):
     """Robot, floor, safety gate, soft PLC, base and cell, wired up."""
     import random
     from types import SimpleNamespace
@@ -490,7 +616,7 @@ def build_mobile_cell(logger=None, gui=False, seed=0, parts=4,
 
     robot = make_sim_robot(logger or NullLogger(), gui=gui)
     built = F.build_floor(robot, seed=seed, parts=parts, bad_part=bad_part,
-                          gui=gui)
+                          gui=gui, near_limit_mm=near_limit_mm)
     bus = InMemoryBus()
     soft_plc = SoftPLC(bus)
     soft_plc.start()
@@ -508,7 +634,8 @@ def build_mobile_cell(logger=None, gui=False, seed=0, parts=4,
     base.believed_pose = base.true_pose
     base.stow()
     cell = MobileCell(robot, supervised, base, built, gui=gui,
-                      use_vision=use_vision, log=log)
+                      use_vision=use_vision, log=log,
+                      camera_noise=camera_noise, noise_seed=seed)
     return SimpleNamespace(robot=robot, built=built, safety=safety,
                            audit=audit, supervised=supervised, base=base,
                            cell=cell, bus=bus, soft_plc=soft_plc,

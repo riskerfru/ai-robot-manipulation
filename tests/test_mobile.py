@@ -151,3 +151,57 @@ def test_full_run_offline_with_injected_mistakes():
     assert w.cell.placements
     assert all(p["error_mm"] <= C.SEAT_TOL_M * 1000
                for p in w.cell.placements)
+
+
+# ---- inspection decision with measurement uncertainty -----------------------
+def _decide(longs, noise=True):
+    stand_in = SimpleNamespace(camera_noise=noise)
+    return C.MobileCell._conformance(stand_in, longs)["decision"]
+
+
+def test_inspection_passes_clearly_inside_tolerance():
+    assert _decide([44.1, 44.2, 44.0, 44.1, 44.2]) == "PASS"
+
+
+def test_inspection_fails_clearly_outside_tolerance():
+    assert _decide([50.4, 50.6, 50.5, 50.5, 50.4]) == "FAIL"
+
+
+def test_inspection_is_in_doubt_near_a_limit():
+    # 41.1 mm is inside 44 +/- 3, but by less than the uncertainty
+    assert _decide([41.1, 41.0, 41.2, 41.1, 41.1]) == "DOUBT"
+
+
+def test_guardian_refuses_a_fitting_the_force_check_blocked():
+    cell = fake_cell(here="MACHINE", held=1, fittings=("fixture",))
+    cell.blocked = {("MACHINE", "fixture")}
+    assert verdict(cell, action="place", into="fixture").code == "G14"
+
+
+# ---- force check, in simulation ---------------------------------------------
+def test_force_check_stops_a_place_onto_a_hidden_chip():
+    pytest.importorskip("pybullet")
+    from mobile.agent import execute
+    from mobile.cell import build_mobile_cell
+    log = lambda *a: None
+    with contextlib.redirect_stdout(io.StringIO()):
+        w = build_mobile_cell(seed=1, parts=2)
+        cell = w.cell
+        cell.scan()
+        part = [t for t in cell.at_station() if not t.container][0]
+        assert execute({"action": "pick", "part": part.id}, cell, log)[0]
+        execute({"action": "goto", "station": "MACHINE"}, cell, log)
+        assert cell.inject_debris("MACHINE", "fixture")
+        cell.scan()
+        seen = [t for t in cell.at_station() if not t.container]
+        ok, text = execute({"action": "place", "into": "fixture"}, cell, log)
+        held = cell.held()
+        blocked = set(cell.blocked)
+        cell.clear_fitting("MACHINE")
+        ok2, _ = execute({"action": "place", "into": "fixture"}, cell, log)
+        w.robot.disconnect()
+    assert not seen                       # the camera cannot see the chip
+    assert not ok and "force check" in text
+    assert held is not None and held.id == part.id    # part kept
+    assert ("MACHINE", "fixture") in blocked
+    assert ok2                            # cleared, then it goes in

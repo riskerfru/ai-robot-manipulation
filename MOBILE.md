@@ -23,11 +23,18 @@ python run_mobile.py --gui "process all the parts in storage"
 python run_mobile.py --gui --offline --mistakes  # no model; a fixed
                                                  # strategy that also
                                                  # tries illegal actions
+python run_mobile.py --gui --near-limit 41.2     # one part too close to
+                                                 # the limit to call
+python run_mobile.py --gui --ideal-camera        # perfect pictures
 python -m mobile.eval_docking --trials 10        # camera vs dead reckoning
+python -m mobile.eval_inspection                 # inspection gauge study
 python record_mobile.py                          # film it (needs ffmpeg)
 ```
 
-While typing: `!lock MACHINE`, `!unlock MACHINE`, `!status`, `quit`.
+While typing: `!lock MACHINE`, `!unlock MACHINE`, `!debris MACHINE`
+(a chip in the fixture the camera cannot see), `!clear MACHINE`,
+`!status`, `quit`. Questions and follow-up orders can refer to earlier
+ones: the model is given the session's previous orders and outcomes.
 
 ## The floor
 
@@ -65,12 +72,62 @@ rung of ladder logic on a PLC.
 | G11 | Only parts that passed inspection may be dispatched |
 | G12 | Inspect / dispatch / wait has something to act on |
 | G13 | Plan has not run past its step budget |
+| G14 | Fitting has not been flagged blocked by the force check |
+
+## Closer to a real cell
+
+**Camera noise.** The mast camera is no longer a perfect render. Each
+picture gets light-level drift, a colour cast, pixel noise, and range
+noise that grows with distance (about 1 mm at 1 m, D415-class), and a
+temporal filter averages four raw frames of the still scene, as depth
+cameras do. `--ideal-camera` turns it off.
+
+**Calibrated inspection.** The size is read from the extent of the
+part's top face and corrected for how the part sits against the pixel
+grid, with constants fitted on reference cubes and checked on sizes the
+fit never saw (`python -m mobile.eval_inspection`):
+
+| Camera | Before correction | After, on unseen sizes |
+|---|---|---|
+| With noise | +1.42 mm mean error | +0.03 mm mean, 0.17 mm spread (1 σ), 0.47 mm worst |
+| Ideal | +1.15 mm mean error | +0.04 mm mean, 0.18 mm spread (1 σ), 0.58 mm worst |
+
+**Decision with uncertainty (ISO 14253-1 guard band).** Each inspection
+averages 5 frames, up to 15 if the result is close to a limit. The
+expanded uncertainty U (about 95 %) combines frame-to-frame spread and
+the calibration spread. A part passes only if it is inside 44 ± 3 mm by
+more than U, fails if outside by more than U, and in between it is
+rejected on doubt: conformance is shown, not assumed. With noise on, a
+41.2 mm part (in tolerance) read 40.8 ± 0.34 mm over 15 frames and was
+rejected on doubt; a 45.8 mm part read 45.5 mm and passed.
+
+**Force checks.** Placing into the fixture or onto the pad is done by
+feel with the wrist force sensor. Contact more than 2.5 mm above where
+the camera expected the surface means something is in the way; no
+contact down to 12 mm below it means the seat is missing. Either way
+the robot stops, keeps the part, lifts clear, and the fitting is
+flagged blocked until an operator clears it (rule G14). Every pick
+reports its grip force.
+
+**Live session with the language model** (claude-opus-4-5, noise on, 3
+parts), one order after another:
+1. "machine one part and inspect it": machined part 1, 50.5 mm, FAIL,
+   to the bin. It tried to approach the machine mid-cycle once (G04).
+2. "what is the robot holding, and what did that part measure?":
+   answered from the cell state.
+3. `!debris MACHINE`, then "machine the next part": the force check
+   stopped the place 5.0 mm early and kept the part; the model put it
+   on the table and told the operator the fixture was blocked.
+4. `!clear MACHINE`, then "carry on with the part you are holding": it
+   picked the part from the table and finished it: 44.7 mm, PASS, to
+   the dispatch tray.
 
 ## Measured
 
 | | Parking error (mean) | Placement error in fixture | Seated (≤ 5 mm) |
 |---|---|---|---|
-| Mast camera | 12.8 mm | 0.8 mm mean, 1.4 mm max | 10 / 10 |
+| Mast camera (ideal pictures) | 12.8 mm | 0.8 mm mean, 1.4 mm max | 10 / 10 |
+| Mast camera with noise (full runs) | | 0.4 to 1.5 mm | all seated |
 | Dead reckoning (map + believed pose) | 11.7 mm | 15.3 mm mean, 26.1 mm max | 0 / 7, then the part was lost |
 
 `python -m mobile.eval_docking --trials 10 --seed 3`. Errors measured

@@ -139,7 +139,8 @@ def lamp_position(name):
 
 
 # ---- the floor ----------------------------------------------------
-def build_floor(robot, seed=0, parts=4, bad_part=True, gui=False):
+def build_floor(robot, seed=0, parts=4, bad_part=True, gui=False,
+                near_limit_mm=None):
     """Lay out the floor. Returns a dict of body ids and the rng."""
     rng = random.Random(seed)
     built = {"tables": {}, "equipment": {}, "lamps": {}, "rng": rng,
@@ -201,9 +202,12 @@ def build_floor(robot, seed=0, parts=4, bad_part=True, gui=False):
              (0.62, -0.12), (0.62, 0.10)]
     rng.shuffle(slots)
     bad = rng.randrange(parts) if bad_part else -1
+    # Optionally one part close to the upper limit, to show what the
+    # inspection does when a measurement is too close to call.
+    near = ((bad + 1) % parts if bad >= 0 else 0) if near_limit_mm else -1
     for i in range(parts):
         ox, oy = slots[i]
-        size = (50.0 if i == bad else
+        size = (50.0 if i == bad else near_limit_mm if i == near else
                 NOMINAL_PART_MM + rng.uniform(-0.6, 0.6)) / 1000
         add_part(robot, f"blank_{i}", size, RAW_RGB,
                  DOCK_X + ox + rng.uniform(-0.012, 0.012),

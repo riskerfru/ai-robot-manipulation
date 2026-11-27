@@ -18,7 +18,18 @@
 #                                                 actions, to show
 #                                                 the guardian refusing
 #
+#   python run_mobile.py --gui --near-limit 41.2
+#                                                 one part this close to
+#                                                 the lower limit: too
+#                                                 close to call, so it
+#                                                 is rejected on doubt
+#   python run_mobile.py --gui --ideal-camera     perfect pictures (no
+#                                                 camera noise)
+#
 #   While typing:  !lock MACHINE   !unlock MACHINE   (operator lockout)
+#                  !debris MACHINE  a chip in the fixture the camera
+#                                   cannot see; the force check finds it
+#                  !clear MACHINE   operator clears a blocked fitting
 #                  !status         quit
 #
 #   Simulation only. The guardian is not a safety function.
@@ -41,7 +52,7 @@ COLOURS = {"OPERATOR": "\033[1;97m", "LLM": "\033[96m", "PLAN": "\033[96m",
            "GUARD": "\033[93m", "NAV": "\033[94m", "CAMERA": "\033[95m",
            "MACHINE": "\033[33m", "INSPECT": "\033[35m", "ROBOT": "\033[92m",
            "DISPATCH": "\033[92m", "FAULT": "\033[91m", "ERROR": "\033[91m",
-           "LOCKOUT": "\033[91m"}
+           "LOCKOUT": "\033[91m", "FORCE": "\033[1;91m"}
 RESET = "\033[0m"
 
 
@@ -71,6 +82,10 @@ def main():
     ap.add_argument("--dead-reckoning", action="store_true",
                     help="aim from the map, not the mast camera")
     ap.add_argument("--no-colour", action="store_true")
+    ap.add_argument("--ideal-camera", action="store_true",
+                    help="no camera noise (perfect rendered pictures)")
+    ap.add_argument("--near-limit", type=float, default=None,
+                    help="make one part this size in mm, e.g. 41.2")
     args = ap.parse_args()
     for stream in (sys.stdout, sys.stderr):
         try:
@@ -99,7 +114,9 @@ def main():
     print("Building the shop floor...", flush=True)
     with contextlib.redirect_stdout(io.StringIO()):
         w = build_mobile_cell(gui=args.gui, seed=args.seed, parts=args.parts,
-                              use_vision=not args.dead_reckoning, log=log)
+                              use_vision=not args.dead_reckoning, log=log,
+                              camera_noise=not args.ideal_camera,
+                              near_limit_mm=args.near_limit)
         w.cell.scan()
     cell = w.cell
     log("CAMERA", "mast camera at STORAGE: " + ", ".join(
@@ -120,6 +137,16 @@ def main():
             if cmd in ("lock", "unlock") and st:
                 cell.lockout(st, cmd == "lock")
                 log("LOCKOUT", f"operator {'locked out' if cmd == 'lock' else 'released'} {st}")
+            elif cmd == "debris" and st:
+                if cell.inject_debris(st, "fixture" if st == "MACHINE"
+                                      else "pad"):
+                    log("FAULT", f"a chip was left in the "
+                                 f"{'fixture' if st == 'MACHINE' else 'pad'} "
+                                 f"at {st} (the camera cannot see it)")
+            elif cmd == "clear" and st:
+                done = cell.clear_fitting(st)
+                log("LOCKOUT", f"operator cleared {', '.join(done) or 'nothing'}"
+                               f" at {st}")
             elif cmd == "status":
                 from mobile.agent import state_summary
                 import json

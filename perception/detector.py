@@ -288,6 +288,18 @@ class ObjectFinder(OverheadDetector):
     MIN_PIXELS = 150
     FLAT_M = 0.004            # a top face is flat to this
     CONTAINER_M = 0.13        # wider than this = something to put in
+    # A real depth camera is not a perfect render. When set (by the
+    # cell), each picture gets light-level drift, a colour cast, pixel
+    # noise, and range noise that grows with distance and is spatially
+    # smoothed as a depth camera's own filter does.
+    #   {"rng": np.random.Generator, "gain": 0.06, "tint": 0.03,
+    #    "rgb_sigma": 0.02, "depth_m_at_1m": 0.0010, "frames": 4}
+    # "frames": a temporal filter, as depth cameras have, averaging
+    # that many raw frames of the still scene into one picture.
+    noise = None
+    # Things lower than this above what they stand on are ignored (0 =
+    # keep all). Stops a noisy fitting floor being read as a part.
+    min_part_m = 0.0
 
     def capture_rgbd(self):
         """Colour image plus the world position of every pixel."""
@@ -310,9 +322,41 @@ class ObjectFinder(OverheadDetector):
                         np.ones_like(depth)], axis=-1)
         world = ndc @ inv.T
         world = world[..., :3] / world[..., 3:4]
+        if self.noise:
+            k = int(self.noise.get("frames", 1))
+            shots = [self._add_noise(image, world, cam) for _ in range(k)]
+            image = sum(s[0] for s in shots) / k
+            world = sum(s[1] for s in shots) / k
         self.last_image = image
         self.last_world = world
         return image, world
+
+    @staticmethod
+    def _box3(a):
+        """3 x 3 mean filter over the first two axes."""
+        pad = [(1, 1), (1, 1)] + [(0, 0)] * (a.ndim - 2)
+        k = np.pad(a, pad, mode="edge")
+        h, w = a.shape[:2]
+        return sum(k[i:i + h, j:j + w] for i in range(3)
+                   for j in range(3)) / 9.0
+
+    def _add_noise(self, image, world, cam):
+        n = self.noise
+        rng = n["rng"]
+        img = np.clip(image * (1.0 + rng.uniform(-n["gain"], n["gain"]))
+                      * (1.0 + rng.uniform(-n["tint"], n["tint"], 3))
+                      + rng.normal(0.0, n["rgb_sigma"], image.shape),
+                      0.0, 1.0)
+        # Range noise along each pixel's ray, sigma ~ k * range^2,
+        # spatially smoothed like a depth camera's own filter.
+        view = np.asarray(cam["view"], dtype=np.float64).reshape(4, 4).T
+        eye = np.linalg.inv(view)[:3, 3]
+        rays = world - eye
+        rng_m = np.linalg.norm(rays, axis=-1, keepdims=True)
+        sigma = n["depth_m_at_1m"] * rng_m ** 2
+        e = self._box3(rng.normal(0.0, 3.0, rng_m.shape)) * sigma
+        world = world + rays / np.maximum(rng_m, 1e-9) * e
+        return img, world
 
     @staticmethod
     def _min_rect(points):
@@ -428,6 +472,15 @@ class ObjectFinder(OverheadDetector):
             # pixel centres span one pixel less than the pixels do.
             long_, short_ = raw_long + 3 * pixel_m, raw_short + 3 * pixel_m
             seen_area = mask.sum() * pixel_m ** 2
+            # The same face with its pinholes filled (noise can knock
+            # single pixels out of a face), for an area-based size.
+            try:
+                from scipy.ndimage import binary_fill_holes
+                rr_, cc_ = np.where(mask)
+                sub = mask[rr_.min():rr_.max() + 1, cc_.min():cc_.max() + 1]
+                filled_area = float(binary_fill_holes(sub).sum()) * pixel_m ** 2
+            except Exception:
+                filled_area = seen_area
             centre = pts.mean(axis=0)
             reach = (np.linalg.norm(pts - centre, axis=1).max()
                      + 0.5 * pixel_m)
@@ -440,6 +493,8 @@ class ObjectFinder(OverheadDetector):
             around = around[around < top - 0.008]
             ground = (float(np.percentile(around, 20)) if around.size
                       else table_z)
+            if float(np.median(z)) - ground < self.min_part_m:
+                continue
             blobs.append(Blob(
                 container=False, x=float(centre[0]), y=float(centre[1]),
                 rgb=colour, long=float(long_), short=float(short_),
@@ -448,6 +503,9 @@ class ObjectFinder(OverheadDetector):
                 roundness=float(seen_area / (np.pi * reach ** 2)),
                 fill=float(seen_area / ((raw_long + pixel_m)
                                         * (raw_short + pixel_m))),
-                pixels=int(mask.sum())))
+                pixels=int(mask.sum()), area_m2=float(seen_area),
+                filled_m2=filled_area,
+                pixel_m=pixel_m, raw_long=float(raw_long),
+                raw_short=float(raw_short)))
         blobs.sort(key=lambda b: -b.pixels)
         return blobs, table_z

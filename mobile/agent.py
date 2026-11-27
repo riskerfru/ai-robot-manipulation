@@ -51,9 +51,21 @@ Actions (JSON objects):
   {"action":"say","text":"..."}
   {"action":"done"}                  the operator's request is complete
 
+Inspection averages several camera frames and reports the size with its
+uncertainty. A part too close to a limit to be sure is rejected on doubt.
+Placing into a fixture or onto the pad is checked by the wrist force
+sensor: if it touches too early (something in the way) or feels nothing,
+the place stops, the part stays in the gripper, and that fitting is
+blocked until the operator clears it. Then put the part on the table or
+tell the operator.
+
 Every action is checked by a fixed rule layer before it runs. If one is
 rejected you are told the rule code and why; propose something else.
 Do not argue with a rejection.
+
+The operator may ask questions or give follow-up orders that refer to
+earlier ones; earlier orders this session are listed. To answer a
+question, use "say" and then "done".
 
 Reply with JSON only:
 {"thinking":"one short sentence","actions":[ ... up to 6 actions ... ]}
@@ -94,6 +106,8 @@ def state_summary(cell):
                     "part": cell.machine["part"],
                     "fault": cell.machine["fault"]},
         "locked_out": sorted(cell.locked),
+        "blocked_fittings": sorted(f"{r} at {s}" for s, r in
+                                   getattr(cell, "blocked", ())),
         "seen_here": visible,
         "fittings_here": fittings,
         "parts": parts,
@@ -134,7 +148,9 @@ def execute(action, cell, log):
         thing = cell.things[action["part"]]
         r = cell.pick(thing)
         ok = r.get("status") == "success"
-        return ok, f"picked part {thing.id}" if ok else r.get("detail", "")
+        grip = f", gripped at {r['grip_n']} N" if "grip_n" in r else ""
+        return ok, (f"picked part {thing.id}{grip}" if ok
+                    else r.get("detail", ""))
     if kind == "place":
         role = action["into"]
         ident = cell.held().id
@@ -144,15 +160,23 @@ def execute(action, cell, log):
             return False, r.get("detail", "place failed")
         extra = (f", {r['placement_error_mm']} mm from fitting centre"
                  if "placement_error_mm" in r else "")
+        if "force_n" in r and r.get("felt_contact"):
+            extra += (f", touched down at {r['force_n']} N "
+                      f"{1000 * (r['contact_z'] - r['expected_z']):+.1f} mm "
+                      f"from expected")
         if role == "fixture" and ok:
             base.stow()
         return True, f"part {ident} placed in {role}{extra}"
     if kind == "inspect":
         r = cell.inspect()
-        log("INSPECT", f"part {r['part']}: measured {r['size_mm']} mm "
-                       f"(nominal {F.NOMINAL_PART_MM:.0f} +/- "
-                       f"{F.PART_TOLERANCE_MM:.0f}) -> {r['result']}")
-        return True, f"part {r['part']} {r['result']} ({r['size_mm']} mm)"
+        why = (" - too close to the limit to be sure, rejected on doubt"
+               if r.get("doubt") else "")
+        log("INSPECT", f"part {r['part']}: {r['size_mm']} mm "
+                       f"+/- {r.get('U_mm', 0)} mm over {r.get('frames', 1)} "
+                       f"frame(s) (nominal {F.NOMINAL_PART_MM:.0f} +/- "
+                       f"{F.PART_TOLERANCE_MM:.0f}) -> {r['result']}{why}")
+        return True, (f"part {r['part']} {r['result']} ({r['size_mm']} mm "
+                      f"+/- {r.get('U_mm', 0)} mm{why})")
     if kind == "wait_machine":
         status = cell.wait_for_machine()
         return status == "done", f"machine {status}"
@@ -172,10 +196,17 @@ class LLMPlanner:
         self.model = model or cfg.AI["model"]
         self.messages = []
         self.usage = {"input": 0, "output": 0, "calls": 0}
+        self.history = []               # earlier orders this session
+
+    def remember(self, command, outcome):
+        self.history.append(f"{command!r} -> {outcome}")
+        self.history = self.history[-6:]
 
     def start(self, command, cell):
+        past = ("Earlier orders this session:\n" + "\n".join(
+            f"- {h}" for h in self.history) + "\n\n") if self.history else ""
         self.messages = [{"role": "user", "content":
-                          f"Operator: {command}\n\nState:\n"
+                          f"{past}Operator: {command}\n\nState:\n"
                           f"{json.dumps(state_summary(cell))}"}]
 
     def feedback(self, text, cell):
@@ -307,7 +338,7 @@ def run(command, cell, planner, log, max_rounds=40, guardian=None):
     planner.start(command, cell)
     log("OPERATOR", command)
     t0, rounds, executed = time.time(), 0, 0
-    finished = False
+    finished, report = False, []
     while rounds < max_rounds and not finished:
         rounds += 1
         try:
@@ -343,6 +374,13 @@ def run(command, cell, planner, log, max_rounds=40, guardian=None):
             if not ok:
                 break
         planner.feedback("Results:\n" + "\n".join(report), cell)
+    if hasattr(planner, "remember"):
+        last = report[-1] if rounds and report else ""
+        planner.remember(command, ("finished" if finished else "stopped")
+                         + f" after {executed} actions"
+                         + (f"; refused: {', '.join(r[1] for r in guardian.rejected)}"
+                            if guardian.rejected else "")
+                         + (f"; last: {last}" if last else ""))
     return {"finished": finished, "rounds": rounds, "executed": executed,
             "checked": guardian.checked, "rejected": guardian.rejected,
             "seconds": time.time() - t0, "sim_seconds": cell.now,

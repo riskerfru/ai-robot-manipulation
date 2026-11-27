@@ -48,6 +48,8 @@ RULES = {
     "G11": ("NOT_INSPECTED", "only PASS parts may be dispatched"),
     "G12": ("NOTHING_TO_DO", "inspect / dispatch has something to act on"),
     "G13": ("STEP_LIMIT", "the plan has not run past its step budget"),
+    "G14": ("FITTING_BLOCKED", "the force check has not flagged the "
+                               "fitting as blocked"),
 }
 
 
@@ -148,6 +150,10 @@ class Guardian:
                 return Verdict(True)
             if cell.equipment(role) is None:
                 return _no("G05", f"there is no {role} at {here}")
+            if (here, role) in getattr(cell, "blocked", ()):
+                return _no("G14", f"the {role} at {here} was felt blocked "
+                                  f"by the force check; an operator must "
+                                  f"clear it first")
             state = cell.state.get(held.id)
             accepts = C.ACCEPTS[role]
             if state not in accepts:

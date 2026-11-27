@@ -1033,9 +1033,13 @@ class FrankaPandaRobot:
                     "detail": f"the fingers closed on nothing at "
                               f"({x:.3f}, {y:.3f})"}
 
+        body = self.objects[name]["id"]
+        grip_n = sum(c[9] for c in p.getContactPoints(bodyA=self.robot,
+                                                      bodyB=body))
         result = self._complete_grasp(name)
         if isinstance(result, dict) and result.get("status") == "success":
             result["gripped"] = name
+            result["grip_n"] = round(grip_n, 1)
         return result
 
     def _body_in_gripper(self):
@@ -1204,12 +1208,17 @@ class FrankaPandaRobot:
 
     def place_by_touch(self, x, y, touch_z, finger_axis=None, open_to=None,
                        on_step=None, label="surface", strict=False,
-                       step_m=0.0005):
+                       step_m=0.0005, jam_m=None, need_contact=False):
         """
         Put the held part down by feel. touch_z is the gripper height
         at which the camera expects the part to meet the surface; the
         arm stops short of it and creeps down until the force sensor
         reports contact, then lets go. The surface is felt, not assumed.
+
+        jam_m: contact felt more than this above where the camera
+        expected means something is in the way: stop, keep the part,
+        lift clear and report it. need_contact: if no surface is felt
+        down to the lower limit, do not let go either.
         """
         if not self.grasped_object:
             return {"status": "failed", "action": "place", "target": label,
@@ -1271,6 +1280,29 @@ class FrankaPandaRobot:
             if force > TOUCH_N:
                 break
         felt = force > TOUCH_N
+        early = z - touch_z
+        if (felt and jam_m is not None and early > jam_m) or (
+                not felt and need_contact):
+            print(f"  [PLACE] Stopping: {'early contact' if felt else 'no contact'}"
+                  f" at z={z:.4f}, keeping the part")
+            ee = self.get_end_effector_position()
+            self._direct_move(ee[0], ee[1], safe_z, speed_factor=0.15,
+                              orn=orn)
+            self._sync_obstacles()
+            return {"status": "failed", "action": "place", "target": label,
+                    "jam": bool(felt), "felt_contact": felt,
+                    "contact_z": round(z, 4), "expected_z": round(touch_z, 4),
+                    "force_n": round(force, 1),
+                    "detail": (f"force check stopped the place: contact at "
+                               f"{force:.1f} N, {1000 * early:+.1f} mm from where "
+                               f"the camera expected (limit "
+                               f"+{1000 * jam_m:.1f} mm) - something is in "
+                               f"the {label}; part kept in the gripper"
+                               if felt else
+                               f"force check stopped the place: no surface "
+                               f"felt down to {1000 * (touch_z - z):.0f} mm "
+                               f"below where the camera expected; part kept "
+                               f"in the gripper")}
         ins._release(name, open_to)
         self._retreat_straight_up(orn)
         self._sync_obstacles()
